@@ -9,25 +9,25 @@ ESP32-C6 Zigbee router device for controlling Hayward/Majestic PC1001 pool heat 
 - **PC1001 Protocol** - Full bidirectional Manchester protocol implementation
 - **Real-time Monitoring** - Water inlet/outlet temperature, programmed setpoint, mode
 - **Home Assistant Ready** - Works with Zigbee2MQTT and ZHA
-- **Reliable Operation** - Based on proven acw02_zb/caelum architecture
 
 ## 📋 Hardware Requirements
 
 - **ESP32-C6** development board (e.g., ESP32-C6-DevKitC-1)
 - **PC1001 Controller** - Hayward/Majestic heat pump with PC1001 control interface
-- **Single wire connection** - GPIO2 to PC1001 data line (bidirectional)
-- **Power supply** - 5V USB (device does not sleep)
+- **Single wire connection** - GPIO2 to PC1001 NET data line (bidirectional)
+- **Power supply** - 5V from PC1001
 
 ## 🔌 Wiring
 
 ```
 ESP32-C6          PC1001 Controller
 --------          -----------------
-GPIO2    <---->   DATA LINE
+GPIO2    <---->   DATA LINE (via level shifter)
 GND      <---->   GND
++5V      <---->   +5V
 ```
 
-⚠️ **Important**: The PC1001 data line operates at **5V** logic levels. You may need a level shifter or ensure your ESP32-C6 GPIO is 5V tolerant. Alternatively, use a voltage divider or bidirectional level converter.
+⚠️ **Important**: The PC1001 data line operates at **5V** logic levels. You need a level shifter. Alternatively, use a voltage divider or bidirectional level converter.
 
 ## 🛠️ Building and Flashing
 
@@ -227,7 +227,6 @@ This project is provided as-is for personal and educational use.
 ## 🙏 Credits
 
 - Based on Arduino MQTT implementation by original author
-- Architecture inspired by acw02_zb and caelum-weatherstation projects
 - ESP-IDF and Zigbee stack by Espressif Systems
 
 ## 🔗 Related Projects
