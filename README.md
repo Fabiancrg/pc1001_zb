@@ -56,17 +56,29 @@ Replace `COMx` with your serial port (e.g., `COM3` on Windows, `/dev/ttyUSB0` on
 
 ## 📡 Zigbee Configuration
 
-The device operates as a **Zigbee End Device** (mains powered, rx_on_when_idle=true) and exposes a **Thermostat cluster**:
+The device operates as a **Zigbee End Device** (mains powered, rx_on_when_idle=true) and exposes **2 endpoints**:
 
 **Note**: Configured as an End Device rather than Router because the device is powered off during winter. End Devices can leave/rejoin the network without disrupting routing for other devices.
 
 ### Endpoint 1 - Thermostat
 - **Cluster**: Thermostat (0x0201)
 - **Attributes**:
-  - `local_temperature` - Water inlet temperature (read-only)
-  - `occupied_cooling_setpoint` - Target cooling temperature (read/write, 15-32°C)
-  - `occupied_heating_setpoint` - Target heating temperature (read/write, 15-32°C)
-  - `system_mode` - Operating mode (off/heat/cool/auto)
+  - `local_temperature` - Water inlet temperature (TEMP_IN, read-only, reportable)
+  - `occupied_cooling_setpoint` - Target cooling temperature (read/write, reportable, 15-32°C)
+  - `occupied_heating_setpoint` - Target heating temperature (read/write, reportable, 15-32°C)
+  - `system_mode` - Operating mode (off/heat/cool/auto, read/write, reportable)
+- **Also includes**: Basic cluster (manufacturer info), Identify cluster
+
+### Endpoint 2 - Temperature Sensor (Water Outlet)
+- **Cluster**: Temperature Measurement (0x0402)
+- **Attributes**:
+  - `measured_value` - Water outlet temperature (TEMP_OUT, read-only, reportable)
+  - `min_measured_value` - -40°C
+  - `max_measured_value` - 60°C
+- **Also includes**: Identify cluster
+- **Note**: No Basic cluster (only on EP1 per Zigbee best practice)
+
+**ESP_ZB_ZCL_ATTR_ACCESS_REPORTING**: All key attributes have the REPORTING flag set, ensuring that reporting configuration persists across device reboots in the zb_storage partition.
 
 ### Supported Modes
 
@@ -81,8 +93,9 @@ The device operates as a **Zigbee End Device** (mains powered, rx_on_when_idle=t
 
 ### Zigbee2MQTT
 
-The device will appear as a thermostat with the following controls:
+The device will appear as a thermostat with two temperature sensors:
 
+**Endpoint 1 (Thermostat)**:
 ```yaml
 climate:
   - platform: mqtt
@@ -98,13 +111,22 @@ climate:
     mode_command_topic: "zigbee2mqtt/PC1001/system_mode/set"
 ```
 
+**Endpoint 2 (Temperature Sensor)**:
+```yaml
+sensor:
+  - platform: mqtt
+    name: "Pool Water Outlet Temperature"
+    state_topic: "zigbee2mqtt/PC1001/temperature_outlet"
+    unit_of_measurement: "°C"
+    device_class: temperature
+```
+
 ### ZHA (Zigbee Home Automation)
 
-The device will be auto-discovered as a thermostat and will expose:
-- Current water temperature
-- Target temperature (0.5°C steps)
-- Operating mode selector
-- Power on/off
+The device will be auto-discovered with:
+- **EP1**: Climate entity with current inlet temperature, target temperature, and mode selector
+- **EP2**: Temperature sensor showing water outlet temperature
+- Target temperature adjustable in 0.5°C steps (15-32°C)
 
 ## 📊 PC1001 Protocol Details
 
