@@ -1,0 +1,11 @@
+build/
+.vscode/
+.idea/
+managed_components/
+Doc/
+PCB/lib/
+PCB/pc1001_zb/*-backups
+PCB/pc1001_zb/~*
+PCB/pc1001_zb/#*
+PCB/pc1001_zb/_*
+PCB/pc1001_zb/*cache

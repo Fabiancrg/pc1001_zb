@@ -1,0 +1,12 @@
+#ifndef VERSION_H
+#define VERSION_H
+
+#define FW_VERSION "@PROJECT_VER@"
+#define FW_VERSION_MAJOR @_ver_major@
+#define FW_VERSION_MINOR @_ver_minor@
+#define FW_VERSION_PATCH @_ver_patch@
+#define FW_BUILD_NUMBER @BUILD_NUMBER@
+#define FW_DATE_CODE "@DATE_CODE@"
+#define FW_OTA_VERSION 0x@OTA_VERSION_HEX_STR@
+
+#endif /* VERSION_H */
