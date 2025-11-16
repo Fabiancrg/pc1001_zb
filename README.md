@@ -461,7 +461,7 @@ This project is provided as-is for personal and educational use.
 
 ## 🔗 Related Projects
 
-- **acw02_zb** - Toshiba HVAC controller (similar UART protocol)
+- **acw02_zb** - Airton HVAC controller (similar UART protocol)
 - **caelum-weatherstation** - Weather station with sleep mode
 - **Aeris_zb** - Air quality sensor with multiple endpoints
 
