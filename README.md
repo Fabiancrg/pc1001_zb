@@ -31,13 +31,6 @@ GND      <---->   GND
 
 The PC1001 NET data line operates at **5V TTL** logic levels while the ESP32-C6 uses **3.3V** GPIO. A bidirectional level shifter is **mandatory** for reliable communication.
 
-#### ❌ **NOT RECOMMENDED: TXB0102DCUR**
-
-The **TXB0102** auto-direction sensing level shifter is **NOT suitable** for this application because:
-- Auto-direction detection causes timing jitter on half-duplex Manchester-encoded signals
-- Transition time (~10-30ns) can introduce errors in timing-critical protocol (1ms pulses)
-- May cause communication errors or unreliable decoding
-
 #### ✅ **RECOMMENDED Option 1: 74LVC1T45 (Push-Pull)**
 
 **Best choice** for push-pull PC1001 output (most common configuration):
@@ -80,6 +73,13 @@ Package: SOT-23
 Price: ~$0.10-0.20
 ```
 
+**Or use pre-made module:**
+```
+Module: DE239 (BSS138-based 4-channel level shifter)
+Price: ~$0.50-1.00
+Advantage: Pre-assembled, no soldering discrete components
+```
+
 **Wiring:**
 ```
          10kΩ              10kΩ
@@ -90,6 +90,17 @@ GPIO2 -----------+--- BSS138 ---+------ NET Pin
                       (G-S-D)   |
                                 |
 GND ----------------------------|------ GND
+```
+
+**Or using DE239 module:**
+```
+ESP32-C6          DE239          PC1001
+--------          -----          ------
+3.3V     ------>  LV             
+GPIO2    ------>  LV1   <---->  HV1  ------>  NET Pin
+GND      ------>  GND   <---->  GND  <------>  GND
+5V       ------>  HV
+                  (LV2-4, HV2-4 unused)
 ```
 
 **Schematic:**
