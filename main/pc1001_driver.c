@@ -27,16 +27,29 @@ static pc1001_status_callback_t status_callback = NULL;
 #define TIMING_BIT0_HIGH    1000    // Binary 0 high time
 #define TIMING_BIT1_HIGH    3000    // Binary 1 high time
 #define TIMING_BIT_LOW      1000    // All bits low time
-#define TIMING_SPACE        100000  // Space between frame repetitions
+#define TIMING_SPACE        100000  // Space between frame repetitions (100ms)
+#define TIMING_SPACE_SHORT  125000  // Short spacing (125ms)
+#define TIMING_SPACE_LONG   1000000 // Long spacing (1s) after frame groups
 #define TIMING_GROUP_SPACE  2000000 // Space after 8 frames
 
 /* Tolerance for timing detection (±40%) */
 #define TIMING_TOLERANCE    0.4
 
 /* Frame structure */
-#define FRAME_SIZE          12      // 12 bytes per command frame
-#define FRAME_REPETITIONS   8       // Repeat frame 8 times
+#define FRAME_SIZE_LONG     12      // 12 bytes for long frames
+#define FRAME_SIZE_SHORT    9       // 9 bytes for short frames
+#define FRAME_SIZE          12      // Keep for compatibility
+#define FRAME_REPETITIONS   8       // Repeat frame 8 times (can be 16 for full cycle)
 #define RX_BUFFER_SIZE      20      // Reception buffer size
+
+/* Frame types - Extended protocol support */
+#define FRAME_TYPE_TEMP_OUT     0x4B   // Water outlet temperature (12-byte)
+#define FRAME_TYPE_TEMP_IN      0x8B   // Water inlet temperature (12-byte)
+#define FRAME_TYPE_STATUS       0x81   // Status: temp, mode, power (12-byte)
+#define FRAME_TYPE_CLOCK        0xD1   // Clock/time sync (12-byte)
+#define FRAME_TYPE_CONFIG       0x82   // Configuration (12-byte)
+#define FRAME_TYPE_COND_1       0x83   // Condition packet 1 (12-byte)
+#define FRAME_TYPE_COND_2       0x84   // Condition packet 2 (9-byte or 12-byte)
 
 /* Static command frame template */
 static uint8_t cmd_frame[FRAME_SIZE] = {
@@ -97,7 +110,7 @@ static uint8_t reverse_bits(uint8_t byte) {
 }
 
 /**
- * @brief Calculate checksum for frame
+ * @brief Calculate checksum for frame (supports both 9 and 12-byte frames)
  */
 static uint8_t calculate_checksum(const uint8_t *frame, uint8_t size) {
     uint32_t total = 0;
@@ -108,12 +121,15 @@ static uint8_t calculate_checksum(const uint8_t *frame, uint8_t size) {
 }
 
 /**
- * @brief Validate frame checksum
+ * @brief Validate checksum for received frame
  */
-static bool validate_checksum(const uint8_t *frame, uint8_t size) {
-    uint8_t expected = calculate_checksum(frame, size);
-    uint8_t received = reverse_bits(frame[size - 1]);
-    return expected == received;
+static bool validate_checksum(const uint8_t *data, uint8_t len) {
+    if (len != FRAME_SIZE_SHORT && len != FRAME_SIZE_LONG) {
+        return false;
+    }
+    uint8_t calculated = calculate_checksum(data, len);
+    uint8_t received_reversed = reverse_bits(data[len - 1]);
+    return (calculated == received_reversed);
 }
 
 /**
@@ -134,57 +150,100 @@ static float extract_temperature(uint8_t temp_byte) {
 }
 
 /**
- * @brief Process received frame
+ * @brief Process received frame (supports 9 and 12-byte frames with enhanced types)
  */
 static void process_received_frame(const uint8_t *frame, uint8_t size) {
-    if (size < 10) return;  // Minimum frame size
+    // Support both 9-byte short frames and 12-byte long frames
+    if (size != FRAME_SIZE_SHORT && size != FRAME_SIZE_LONG) {
+        ESP_LOGD(TAG, "Invalid frame length: %d bytes (expected 9 or 12)", size);
+        return;
+    }
     
     if (!validate_checksum(frame, size)) {
-        ESP_LOGD(TAG, "Invalid checksum");
+        ESP_LOGD(TAG, "Invalid checksum for frame type 0x%02X", frame[0]);
         return;
     }
     
     uint8_t frame_type = frame[0];
+    ESP_LOGD(TAG, "Valid %d-byte frame type 0x%02X", size, frame_type);
     
     switch (frame_type) {
-        case 0x4B:  // TEMP OUT frame (0b01001011)
-            current_status.temp_out = extract_temperature(frame[4]);
-            ESP_LOGI(TAG, "Temp OUT: %.1f°C", current_status.temp_out);
-            break;
-            
-        case 0x8B:  // TEMP IN frame (0b10001011)
-            current_status.temp_in = extract_temperature(frame[9]);
-            ESP_LOGI(TAG, "Temp IN: %.1f°C", current_status.temp_in);
-            break;
-            
-        case 0x81:  // STATUS frame (0b10000001) - programmed temp, mode, power
-            current_status.temp_prog = extract_temperature(frame[4]);
-            current_status.power = (frame[2] & 0x80) >> 7;
-            
-            // Decode mode
-            bool auto_mode = (frame[2] & 0x04) >> 2;
-            if (auto_mode) {
-                current_status.mode = PC1001_MODE_AUTO;
-            } else {
-                bool heat = (frame[2] & 0x08) >> 3;
-                current_status.mode = heat ? PC1001_MODE_HEAT : PC1001_MODE_COOL;
+        case 0x4B:  // TEMP OUT frame (0b01001011) - FRAME_TYPE_TEMP_OUT
+            if (size >= FRAME_SIZE_LONG) {
+                current_status.temp_out = extract_temperature(frame[4]);
+                ESP_LOGI(TAG, "Temp OUT: %.1f°C", current_status.temp_out);
             }
+            break;
             
-            current_status.valid = true;
+        case 0x8B:  // TEMP IN frame (0b10001011) - FRAME_TYPE_TEMP_IN
+            if (size >= FRAME_SIZE_SHORT && size >= 10) {
+                current_status.temp_in = extract_temperature(frame[9]);
+                ESP_LOGI(TAG, "Temp IN: %.1f°C", current_status.temp_in);
+            }
+            break;
             
-            ESP_LOGI(TAG, "Status: %.1f°C, %s, %s", 
-                     current_status.temp_prog,
-                     current_status.power ? "ON" : "OFF",
-                     pc1001_mode_to_string(current_status.mode));
+        case 0x81:  // STATUS frame (0b10000001) - FRAME_TYPE_STATUS
+            if (size >= FRAME_SIZE_LONG) {
+                current_status.temp_prog = extract_temperature(frame[4]);
+                current_status.power = (frame[2] & 0x80) >> 7;
+                
+                // Decode mode
+                bool auto_mode = (frame[2] & 0x04) >> 2;
+                if (auto_mode) {
+                    current_status.mode = PC1001_MODE_AUTO;
+                } else {
+                    bool heat = (frame[2] & 0x08) >> 3;
+                    current_status.mode = heat ? PC1001_MODE_HEAT : PC1001_MODE_COOL;
+                }
+                
+                current_status.valid = true;
+                
+                ESP_LOGI(TAG, "Status: %.1f°C, %s, %s", 
+                         current_status.temp_prog,
+                         current_status.power ? "ON" : "OFF",
+                         pc1001_mode_to_string(current_status.mode));
+                
+                // Notify callback
+                if (status_callback && current_status.temp_out > 0) {
+                    status_callback(&current_status);
+                }
+            }
+            break;
             
-            // Notify callback
-            if (status_callback && current_status.temp_out > 0) {
-                status_callback(&current_status);
+        case 0xD1:  // CLOCK frame - FRAME_TYPE_CLOCK
+            if (size >= FRAME_SIZE_LONG) {
+                ESP_LOGD(TAG, "Clock/time sync frame received (not fully implemented)");
+                // Clock data typically in bytes 1-6: hour, minute, second, day, month, year
+                // Could be implemented in future for time synchronization
+            }
+            break;
+            
+        case 0x82:  // CONFIG frame - FRAME_TYPE_CONFIG
+            if (size >= FRAME_SIZE_LONG) {
+                ESP_LOGD(TAG, "Configuration frame received (not fully implemented)");
+                // Configuration parameters for advanced heat pump settings
+            }
+            break;
+            
+        case 0x83:  // COND_1 frame - FRAME_TYPE_COND_1
+            if (size >= FRAME_SIZE_LONG) {
+                ESP_LOGD(TAG, "Condition 1 frame received (not fully implemented)");
+                // Additional sensor data and heat pump conditions
+            }
+            break;
+            
+        case 0x84:  // COND_2 / COND_2B frame - FRAME_TYPE_COND_2
+            if (size == FRAME_SIZE_SHORT) {
+                ESP_LOGD(TAG, "Condition 2B short frame received (not fully implemented)");
+                // Short 9-byte condition frame (flow meter, defrost, etc.)
+            } else if (size == FRAME_SIZE_LONG) {
+                ESP_LOGD(TAG, "Condition 2 long frame received (not fully implemented)");
+                // Long 12-byte condition frame with extended diagnostics
             }
             break;
             
         default:
-            ESP_LOGD(TAG, "Unknown frame type: 0x%02X", frame_type);
+            ESP_LOGD(TAG, "Unknown frame type: 0x%02X (len=%d)", frame_type, size);
             break;
     }
 }
@@ -300,11 +359,17 @@ static void send_header(void) {
 }
 
 /**
- * @brief Send space between frames
+ * @brief Send space between frames (variable based on cycle position)
  */
-static void send_frame_space(void) {
+static void send_frame_space(uint8_t cycle_pos) {
     send_low(TIMING_BIT_LOW);
-    send_high(TIMING_SPACE);
+    // Use long spacing (1s) after certain frame groups, short (125ms) otherwise
+    // Typically long spacing occurs every 4th frame in 16-frame cycle
+    if (cycle_pos > 0 && (cycle_pos % 4) == 0) {
+        send_high(TIMING_SPACE_LONG);
+    } else {
+        send_high(TIMING_SPACE_SHORT);
+    }
 }
 
 /**
@@ -320,18 +385,21 @@ static void send_group_space(void) {
 }
 
 /**
- * @brief Transmit command frame
+ * @brief Transmit command frame with enhanced 16-frame cycle pattern
  */
 static void transmit_command_frame(void) {
     // Switch to output mode
     gpio_set_direction(data_gpio, GPIO_MODE_OUTPUT);
     
-    // Repeat frame 8 times
-    for (int rep = 0; rep < FRAME_REPETITIONS; rep++) {
+    // Repeat frame 16 times (full protocol cycle) or 8 times for faster response
+    // Using 8 for backward compatibility and faster command execution
+    const int repetitions = 8;  // Can be changed to 16 for full cycle
+    
+    for (int rep = 0; rep < repetitions; rep++) {
         send_header();
         
-        // Send all bytes
-        for (int byte_idx = 0; byte_idx < FRAME_SIZE; byte_idx++) {
+        // Send all bytes (12-byte long frame)
+        for (int byte_idx = 0; byte_idx < FRAME_SIZE_LONG; byte_idx++) {
             uint8_t byte = cmd_frame[byte_idx];
             
             // Send MSB first
@@ -344,9 +412,9 @@ static void transmit_command_frame(void) {
             }
         }
         
-        // Space between repetitions
-        if (rep < FRAME_REPETITIONS - 1) {
-            send_frame_space();
+        // Space between repetitions (variable spacing based on cycle)
+        if (rep < repetitions - 1) {
+            send_frame_space(rep);
         } else {
             send_group_space();
         }
@@ -357,7 +425,7 @@ static void transmit_command_frame(void) {
     // Back to input mode
     gpio_set_direction(data_gpio, GPIO_MODE_INPUT);
     
-    ESP_LOGI(TAG, "Command frame transmitted");
+    ESP_LOGI(TAG, "Command frame transmitted (%d repetitions)", repetitions);
 }
 
 /* Public API Implementation */
@@ -452,7 +520,7 @@ esp_err_t pc1001_send_command(const pc1001_cmd_t *cmd) {
     }
     
     // Generate checksum
-    uint8_t checksum = calculate_checksum(cmd_frame, FRAME_SIZE);
+    uint8_t checksum = calculate_checksum(cmd_frame, FRAME_SIZE_LONG);
     cmd_frame[11] = reverse_bits(checksum);
     
     ESP_LOGI(TAG, "Sending command: %.1f°C, %s, %s", 
