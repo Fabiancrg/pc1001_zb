@@ -11,8 +11,12 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "driver/gpio.h"
+#include "esp_mac.h"
+#include "esp_ota_ops.h"
 #include "ha/esp_zigbee_ha_standard.h"
 #include "pc1001_driver.h"
+#include "esp_zb_ota.h"
 #include "version.h"
 
 static const char *TAG = "PC1001_ZB";
@@ -20,16 +24,20 @@ static const char *TAG = "PC1001_ZB";
 /* GPIO Configuration */
 #define PC1001_DATA_GPIO        GPIO_NUM_2      // GPIO2 for PC1001 data line
 
+/* Boot button configuration for factory reset */
+#define BOOT_BUTTON_GPIO        GPIO_NUM_9
+#define BUTTON_LONG_PRESS_TIME_MS   5000
+
 /* Zigbee Channel Configuration */
-#define ESP_ZB_PRIMARY_CHANNEL_MASK    (1 << 15)  // Channel 15
+#define ESP_ZB_PRIMARY_CHANNEL_MASK    ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK  // Scan all channels
 
 /* Zigbee Endpoints */
 #define HA_THERMOSTAT_ENDPOINT      1
 #define HA_TEMP_OUTPUT_ENDPOINT     2       // Temperature output sensor (TEMP_OUT)
 
-/* Manufacturer Information */
-#define MANUFACTURER_NAME       "Fabiancrg"
-#define MODEL_IDENTIFIER        "PC1001_ZB_v1"
+/* Manufacturer Information - Zigbee string format (first byte = length) */
+#define MANUFACTURER_NAME       "\x14""Custom devices (DiY)"        // Length: 20 bytes
+#define MODEL_IDENTIFIER        "\x09""PC1001_ZB"                   // Length: 9 bytes
 
 /* Temperature conversion */
 #define TEMP_TO_ZCL(temp_c)     ((int16_t)((temp_c) * 100))  // °C to centidegrees
@@ -47,6 +55,130 @@ static bool zigbee_connected = false;
 /* Deferred update flag */
 static bool pending_update = false;
 static pc1001_cmd_t pending_cmd;
+
+/* Boot button state */
+static QueueHandle_t button_evt_queue = NULL;
+
+/********************* Function Declarations **************************/
+static esp_err_t button_init(void);
+static void button_task(void *arg);
+static void factory_reset_device(uint8_t param);
+
+/* Factory reset function */
+static void factory_reset_device(uint8_t param)
+{
+    ESP_LOGW(TAG, "[RESET] Performing factory reset...");
+    esp_zb_factory_reset();
+    ESP_LOGI(TAG, "[RESET] Factory reset successful - device will restart");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+}
+
+/* Boot button ISR handler */
+static void IRAM_ATTR button_isr_handler(void *arg)
+{
+    uint32_t gpio_num = BOOT_BUTTON_GPIO;
+    xQueueSendFromISR(button_evt_queue, &gpio_num, NULL);
+}
+
+/* Button monitoring task */
+static void button_task(void *arg)
+{
+    uint32_t io_num;
+    TickType_t press_start_time = 0;
+    bool long_press_triggered = false;
+    const TickType_t LONG_PRESS_DURATION = pdMS_TO_TICKS(BUTTON_LONG_PRESS_TIME_MS);
+    const TickType_t DEBOUNCE_TIME = pdMS_TO_TICKS(50);  // 50ms debounce
+    
+    ESP_LOGI(TAG, "[BUTTON] Task started - waiting for button events");
+    
+    for (;;) {
+        if (xQueueReceive(button_evt_queue, &io_num, portMAX_DELAY)) {
+            // Debounce
+            vTaskDelay(DEBOUNCE_TIME);
+            
+            gpio_intr_disable(BOOT_BUTTON_GPIO);
+            int button_level = gpio_get_level(BOOT_BUTTON_GPIO);
+            
+            if (button_level == 0) {  // Button pressed
+                press_start_time = xTaskGetTickCount();
+                long_press_triggered = false;
+                ESP_LOGI(TAG, "[BUTTON] Pressed - hold 5 sec for factory reset");
+                
+                // Poll button state with timeout to prevent infinite loop
+                TickType_t poll_count = 0;
+                const TickType_t MAX_POLL_TIME = pdMS_TO_TICKS(10000);  // 10s max
+                
+                while (gpio_get_level(BOOT_BUTTON_GPIO) == 0 && poll_count < MAX_POLL_TIME) {
+                    TickType_t current_time = xTaskGetTickCount();
+                    if ((current_time - press_start_time) >= LONG_PRESS_DURATION && !long_press_triggered) {
+                        long_press_triggered = true;
+                        ESP_LOGW(TAG, "[BUTTON] Long press detected! Triggering factory reset...");
+                        esp_zb_scheduler_alarm((esp_zb_callback_t)factory_reset_device, 0, 100);
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    poll_count += pdMS_TO_TICKS(100);
+                }
+                
+                if (!long_press_triggered) {
+                    uint32_t press_duration = pdTICKS_TO_MS(xTaskGetTickCount() - press_start_time);
+                    ESP_LOGI(TAG, "[BUTTON] Released (held for %lu ms)", press_duration);
+                }
+            }
+            
+            // Re-enable interrupt after debounce
+            vTaskDelay(DEBOUNCE_TIME);
+            gpio_intr_enable(BOOT_BUTTON_GPIO);
+        }
+    }
+}
+
+/* Initialize boot button */
+static esp_err_t button_init(void)
+{
+    ESP_LOGI(TAG, "[INIT] Initializing boot button on GPIO%d", BOOT_BUTTON_GPIO);
+    
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_NEGEDGE,
+        .pin_bit_mask = (1ULL << BOOT_BUTTON_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+    };
+    
+    esp_err_t ret = gpio_config(&io_conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "[ERROR] Failed to configure GPIO: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    button_evt_queue = xQueueCreate(10, sizeof(uint32_t));
+    if (!button_evt_queue) {
+        ESP_LOGE(TAG, "[ERROR] Failed to create event queue");
+        return ESP_FAIL;
+    }
+    
+    esp_err_t isr_ret = gpio_install_isr_service(0);
+    if (isr_ret != ESP_OK && isr_ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "[ERROR] Failed to install ISR service: %s", esp_err_to_name(isr_ret));
+        return isr_ret;
+    }
+    
+    ret = gpio_isr_handler_add(BOOT_BUTTON_GPIO, button_isr_handler, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "[ERROR] Failed to add ISR handler: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    BaseType_t task_ret = xTaskCreate(button_task, "button_task", 2048, NULL, 10, NULL);
+    if (task_ret != pdPASS) {
+        ESP_LOGE(TAG, "[ERROR] Failed to create button task");
+        return ESP_FAIL;
+    }
+    
+    ESP_LOGI(TAG, "[OK] Boot button initialization complete");
+    return ESP_OK;
+}
 
 /**
  * @brief Map PC1001 mode to Zigbee system mode
@@ -263,6 +395,16 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
         case ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID:
             ret = zb_attribute_handler((esp_zb_zcl_set_attr_value_message_t *)message);
             break;
+        
+        case ESP_ZB_CORE_OTA_UPGRADE_VALUE_CB_ID:
+            ESP_LOGD(TAG, "[OTA] Upgrade value callback triggered");
+            ret = zb_ota_upgrade_value_handler(*(esp_zb_zcl_ota_upgrade_value_message_t *)message);
+            break;
+        
+        case ESP_ZB_CORE_OTA_UPGRADE_QUERY_IMAGE_RESP_CB_ID:
+            ESP_LOGI(TAG, "[OTA] Query image response callback triggered");
+            ret = zb_ota_query_image_resp_handler(*(esp_zb_zcl_ota_upgrade_query_image_resp_message_t *)message);
+            break;
             
         default:
             ESP_LOGW(TAG, "Receive Zigbee action(0x%x) callback", callback_id);
@@ -348,14 +490,14 @@ static void esp_zb_task(void *pvParameters) {
         .nwk_cfg = {
             .zed_cfg = {
                 .ed_timeout = ESP_ZB_ED_AGING_TIMEOUT_64MIN,
-                .keep_alive = 0,  // 0 = always awake (mains powered)
+                .keep_alive = 3000,  // Keep-alive interval in milliseconds (3 seconds)
             },
         },
     };
     
     esp_zb_init(&zb_nwk_cfg);
     
-    // Set rx_on_when_idle to true (device never sleeps - mains powered)
+    // Set rx_on_when_idle to true (device always listening - mains powered)
     esp_zb_set_rx_on_when_idle(true);
     
     // Create endpoint list
@@ -371,18 +513,63 @@ static void esp_zb_task(void *pvParameters) {
     };
     esp_zb_attribute_list_t *esp_zb_basic_cluster = esp_zb_basic_cluster_create(&basic_cfg);
     
-    // Add manufacturer info
-    uint8_t manufacturer_name[sizeof(MANUFACTURER_NAME)] = {sizeof(MANUFACTURER_NAME) - 1};
-    memcpy(&manufacturer_name[1], MANUFACTURER_NAME, sizeof(MANUFACTURER_NAME) - 1);
+    // Add manufacturer info (already in Zigbee string format with length byte)
     esp_zb_basic_cluster_add_attr(esp_zb_basic_cluster, 
                                   ESP_ZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID, 
-                                  manufacturer_name);
+                                  (void *)MANUFACTURER_NAME);
     
-    uint8_t model_identifier[sizeof(MODEL_IDENTIFIER)] = {sizeof(MODEL_IDENTIFIER) - 1};
-    memcpy(&model_identifier[1], MODEL_IDENTIFIER, sizeof(MODEL_IDENTIFIER) - 1);
     esp_zb_basic_cluster_add_attr(esp_zb_basic_cluster, 
                                   ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID, 
-                                  model_identifier);
+                                  (void *)MODEL_IDENTIFIER);
+    
+    // Add optional Basic cluster attributes for version info
+    #ifdef FW_VERSION_MAJOR
+    // Application version (encode as major.minor in hex)
+    uint8_t app_version = (FW_VERSION_MAJOR << 4) | FW_VERSION_MINOR;  // e.g., 1.0 = 0x10
+    esp_zb_basic_cluster_add_attr(esp_zb_basic_cluster, 
+                                  ESP_ZB_ZCL_ATTR_BASIC_APPLICATION_VERSION_ID, 
+                                  &app_version);
+    #endif
+    
+    // Stack version (Zigbee 3.0 = 0x03)
+    #ifdef ZB_STACK_VERSION
+    uint8_t stack_version = ZB_STACK_VERSION & 0xFF;
+    esp_zb_basic_cluster_add_attr(esp_zb_basic_cluster, 
+                                  ESP_ZB_ZCL_ATTR_BASIC_STACK_VERSION_ID, 
+                                  &stack_version);
+    #endif
+    
+    // Hardware version
+    uint8_t hw_version = 1;
+    esp_zb_basic_cluster_add_attr(esp_zb_basic_cluster, 
+                                  ESP_ZB_ZCL_ATTR_BASIC_HW_VERSION_ID, 
+                                  &hw_version);
+    
+    // Date code (format: YYYYMMDD)
+    #ifdef FW_DATE_CODE
+    static char date_code[17];  // 16 chars max + null terminator
+    const char *date_str = FW_DATE_CODE;
+    size_t date_len = strlen(date_str);
+    if (date_len > 16) date_len = 16;
+    date_code[0] = date_len;  // First byte is length
+    memcpy(&date_code[1], date_str, date_len);
+    esp_zb_basic_cluster_add_attr(esp_zb_basic_cluster, 
+                                  ESP_ZB_ZCL_ATTR_BASIC_DATE_CODE_ID, 
+                                  date_code);
+    #endif
+    
+    // Software build ID (firmware version string)
+    #ifdef FW_VERSION
+    static char sw_build_id[17];  // 16 chars max + null terminator
+    const char *version_str = FW_VERSION;
+    size_t version_len = strlen(version_str);
+    if (version_len > 16) version_len = 16;
+    sw_build_id[0] = version_len;  // First byte is length
+    memcpy(&sw_build_id[1], version_str, version_len);
+    esp_zb_basic_cluster_add_attr(esp_zb_basic_cluster, 
+                                  ESP_ZB_ZCL_ATTR_BASIC_SW_BUILD_ID, 
+                                  sw_build_id);
+    #endif
     
     ESP_ERROR_CHECK(esp_zb_cluster_list_add_basic_cluster(esp_zb_thermostat_clusters, 
                                                           esp_zb_basic_cluster, 
@@ -442,6 +629,39 @@ static void esp_zb_task(void *pvParameters) {
     ESP_ERROR_CHECK(esp_zb_cluster_list_add_identify_cluster(esp_zb_thermostat_clusters, 
                                                              esp_zb_identify_cluster_create(&identify_cfg), 
                                                              ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+    
+    // Add OTA cluster for firmware updates
+    ESP_LOGI(TAG, "  [+] Adding OTA cluster (0x0019)...");
+    uint32_t fw_version = esp_zb_ota_get_fw_version();
+    esp_zb_ota_cluster_cfg_t ota_cluster_cfg = {
+        .ota_upgrade_file_version = fw_version,
+        .ota_upgrade_manufacturer = OTA_UPGRADE_MANUFACTURER,
+        .ota_upgrade_image_type = OTA_UPGRADE_IMAGE_TYPE,
+        .ota_upgrade_downloaded_file_ver = 0xFFFFFFFF,
+    };
+    esp_zb_attribute_list_t *esp_zb_ota_cluster = esp_zb_ota_cluster_create(&ota_cluster_cfg);
+    
+    // Add OTA cluster attributes
+    uint32_t current_file_version = ota_cluster_cfg.ota_upgrade_file_version;
+    esp_zb_ota_cluster_add_attr(esp_zb_ota_cluster, 0x0003, &current_file_version);
+    
+    // Add client-specific OTA attributes
+    esp_zb_zcl_ota_upgrade_client_variable_t client_vars = {
+        .timer_query = ESP_ZB_ZCL_OTA_UPGRADE_QUERY_TIMER_COUNT_DEF,
+        .hw_version = 0x0101,
+        .max_data_size = 223,
+    };
+    esp_zb_ota_cluster_add_attr(esp_zb_ota_cluster, ESP_ZB_ZCL_ATTR_OTA_UPGRADE_CLIENT_DATA_ID, &client_vars);
+    
+    uint16_t server_addr = 0xffff;
+    esp_zb_ota_cluster_add_attr(esp_zb_ota_cluster, ESP_ZB_ZCL_ATTR_OTA_UPGRADE_SERVER_ADDR_ID, &server_addr);
+    
+    uint8_t server_ep = 0xff;
+    esp_zb_ota_cluster_add_attr(esp_zb_ota_cluster, ESP_ZB_ZCL_ATTR_OTA_UPGRADE_SERVER_ENDPOINT_ID, &server_ep);
+    
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_ota_cluster(esp_zb_thermostat_clusters, esp_zb_ota_cluster,
+                                                        ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE));
+    ESP_LOGI(TAG, "  [OK] OTA cluster added (FW version: 0x%08lX)", ota_cluster_cfg.ota_upgrade_file_version);
     
     // Create endpoint
     esp_zb_endpoint_config_t endpoint_config = {
@@ -504,9 +724,51 @@ void app_main(void) {
     // Initialize NVS
     ESP_ERROR_CHECK(nvs_flash_init());
     
+    // Check OTA status and validate firmware
+    ESP_LOGI(TAG, "=== OTA Validation Check ===");
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t ota_state;
+    if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
+        if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+            ESP_LOGW(TAG, "OTA firmware pending verification - validating...");
+            // Firmware successfully booted after OTA update
+            esp_ota_mark_app_valid_cancel_rollback();
+            ESP_LOGI(TAG, "OTA firmware validated successfully!");
+        } else if (ota_state == ESP_OTA_IMG_VALID) {
+            ESP_LOGI(TAG, "Running validated firmware");
+        } else if (ota_state == ESP_OTA_IMG_INVALID || ota_state == ESP_OTA_IMG_ABORTED) {
+            ESP_LOGW(TAG, "Running firmware in invalid/aborted state");
+        }
+    }
+    ESP_LOGI(TAG, "Running partition: %s at 0x%lx", running->label, running->address);
+    
+    // Initialize OTA
+    ESP_ERROR_CHECK(esp_zb_ota_init());
+    
+    // Configure external antenna for ESP32-C6
+    // GPIO3 controls antenna switch (HIGH = external, LOW = internal)
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << GPIO_NUM_3),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+    gpio_set_level(GPIO_NUM_3, 1);  // Enable external antenna
+    ESP_LOGI(TAG, "[INIT] External antenna enabled on GPIO3");
+    
     ESP_LOGI(TAG, "ESP32-C6 PC1001 Pool Heat Pump Controller");
     ESP_LOGI(TAG, "Version: %s", FW_VERSION);
     ESP_LOGI(TAG, "Zigbee: End Device (mains powered, no sleep)");
+    
+    // Initialize boot button for factory reset
+    ESP_LOGI(TAG, "[INIT] Initializing boot button...");
+    esp_err_t button_ret = button_init();
+    if (button_ret != ESP_OK) {
+        ESP_LOGE(TAG, "[ERROR] Button initialization failed");
+        // Continue anyway - button is optional
+    }
     
     // Initialize PC1001 driver
     ESP_ERROR_CHECK(pc1001_driver_init(PC1001_DATA_GPIO, pc1001_status_callback));

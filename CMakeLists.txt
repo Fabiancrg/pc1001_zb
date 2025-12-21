@@ -25,11 +25,18 @@ list(GET _ver_list 2 _ver_patch)
 # Calculate OTA version dec
 math(EXPR OTA_VERSION_DEC "((${_ver_major}) << 24) | ((${_ver_minor}) << 16) | (${_ver_patch})")
 
-# Add compile definitions for version
-add_compile_definitions(PROJECT_VER_MAJOR=${_ver_major})
-add_compile_definitions(PROJECT_VER_MINOR=${_ver_minor})
-add_compile_definitions(PROJECT_VER_PATCH=${_ver_patch})
-add_compile_definitions(OTA_FILE_VERSION=${OTA_VERSION_DEC})
+# Add compile definitions for version and OTA
+add_compile_definitions(
+    FW_VERSION="${PROJECT_VER}.${BUILD_NUMBER}"
+    FW_DATE_CODE="${DATE_CODE}"
+    FW_VERSION_MAJOR=${_ver_major}
+    FW_VERSION_MINOR=${_ver_minor}
+    FW_VERSION_PATCH=${_ver_patch}
+    OTA_FILE_VERSION=${OTA_VERSION_DEC}
+    OTA_MANUFACTURER=${MANUFACTURER_CODE}
+    OTA_IMAGE_TYPE=${IMAGE_TYPE}
+    ZB_STACK_VERSION=${ZIGBEE_STACK_VERSION}
+)
 
 
 # Convert OTA_VERSION_DEC to 8-digit uppercase hex string (CMake <3.19 workaround)
