@@ -256,9 +256,18 @@ static void receiver_task(void *arg) {
     
     int last_level = 1;
     int64_t last_time = esp_timer_get_time();
+    uint32_t loop_counter = 0;
     
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1));  // 1ms polling
+        ets_delay_us(200);  // 200µs polling to match Arduino timing
+        
+        // Feed watchdog every ~1ms (5 iterations x 200µs)
+        // Use pdMS_TO_TICKS(1) to ensure proper yield
+        loop_counter++;
+        if (loop_counter >= 5) {
+            vTaskDelay(pdMS_TO_TICKS(1));  // Yield for 1ms to reset watchdog
+            loop_counter = 0;
+        }
         
         int level = gpio_get_level(data_gpio);
         int64_t now = esp_timer_get_time();
@@ -359,17 +368,12 @@ static void send_header(void) {
 }
 
 /**
- * @brief Send space between frames (variable based on cycle position)
+ * @brief Send space between frames (matches Arduino: 100ms between frames)
  */
 static void send_frame_space(uint8_t cycle_pos) {
     send_low(TIMING_BIT_LOW);
-    // Use long spacing (1s) after certain frame groups, short (125ms) otherwise
-    // Typically long spacing occurs every 4th frame in 16-frame cycle
-    if (cycle_pos > 0 && (cycle_pos % 4) == 0) {
-        send_high(TIMING_SPACE_LONG);
-    } else {
-        send_high(TIMING_SPACE_SHORT);
-    }
+    // Match Arduino: always 100ms between frame repetitions
+    send_high(TIMING_SPACE);
 }
 
 /**
@@ -439,12 +443,13 @@ esp_err_t pc1001_driver_init(gpio_num_t gpio_num, pc1001_status_callback_t callb
     data_gpio = gpio_num;
     status_callback = callback;
     
-    // Configure GPIO as input with pull-down
+    // Configure GPIO as input without internal pull resistors
+    // Hardware has external 10K pull-ups on both sides of BSS138 level shifter
     gpio_config_t io_conf = {
         .intr_type = GPIO_INTR_DISABLE,
         .mode = GPIO_MODE_INPUT,
         .pin_bit_mask = (1ULL << data_gpio),
-        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .pull_up_en = GPIO_PULLUP_DISABLE,
     };
     esp_err_t ret = gpio_config(&io_conf);
@@ -477,8 +482,8 @@ esp_err_t pc1001_send_command(const pc1001_cmd_t *cmd) {
         return ESP_ERR_INVALID_ARG;
     }
     
-    if (cmd->temp < 15.0f || cmd->temp > 32.0f) {
-        ESP_LOGE(TAG, "Temperature out of range: %.1f (must be 15-32°C)", cmd->temp);
+    if (cmd->temp < 15.0f || cmd->temp > 33.0f) {
+        ESP_LOGE(TAG, "Temperature out of range: %.1f (must be 15-33°C)", cmd->temp);
         return ESP_ERR_INVALID_ARG;
     }
     
