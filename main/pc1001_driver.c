@@ -155,17 +155,17 @@ static float extract_temperature(uint8_t temp_byte) {
 static void process_received_frame(const uint8_t *frame, uint8_t size) {
     // Support both 9-byte short frames and 12-byte long frames
     if (size != FRAME_SIZE_SHORT && size != FRAME_SIZE_LONG) {
-        ESP_LOGD(TAG, "Invalid frame length: %d bytes (expected 9 or 12)", size);
+        ESP_LOGI(TAG, "Invalid frame length: %d bytes (expected 9 or 12)", size);
         return;
     }
     
     if (!validate_checksum(frame, size)) {
-        ESP_LOGD(TAG, "Invalid checksum for frame type 0x%02X", frame[0]);
+        ESP_LOGI(TAG, "Invalid checksum for frame type 0x%02X", frame[0]);
         return;
     }
     
     uint8_t frame_type = frame[0];
-    ESP_LOGD(TAG, "Valid %d-byte frame type 0x%02X", size, frame_type);
+    ESP_LOGI(TAG, "Valid %d-byte frame type 0x%02X", size, frame_type);
     
     switch (frame_type) {
         case 0x4B:  // TEMP OUT frame (0b01001011) - FRAME_TYPE_TEMP_OUT
@@ -258,6 +258,11 @@ static void receiver_task(void *arg) {
     int64_t last_time = esp_timer_get_time();
     uint32_t loop_counter = 0;
     
+    // Activity monitoring
+    uint32_t edge_count = 0;
+    int64_t last_activity_report = esp_timer_get_time();
+    const int64_t ACTIVITY_REPORT_INTERVAL = 10000000; // 10 seconds
+    
     while (1) {
         ets_delay_us(200);  // 200µs polling to match Arduino timing
         
@@ -275,9 +280,18 @@ static void receiver_task(void *arg) {
         
         if (level != last_level) {
             // Edge detected
+            edge_count++;
+            
             if (last_level == 1 && level == 0) {
                 // Falling edge - end of HIGH pulse
-                int duration_ms = duration / 1000;
+                int64_t duration_us = duration;
+                int64_t duration_ms = duration_us / 1000;
+                
+                // Log pulses that might be protocol-related (>500us)
+                if (duration_us >= 500) {
+                    ESP_LOGI(TAG, "Falling edge: HIGH was %lld us (%.1f ms)", 
+                             duration_us, (float)duration_us / 1000.0f);
+                }
                 
                 if (duration_ms >= 22 && duration_ms <= 28) {
                     // Start of frame (5ms ± tolerance)
@@ -285,7 +299,7 @@ static void receiver_task(void *arg) {
                     rx_bit_count = 0;
                     rx_bit_buffer = 0;
                     rx_byte_count = 0;
-                    ESP_LOGD(TAG, "Frame start detected");
+                    ESP_LOGI(TAG, "Frame start detected (pulse: %lld ms)", duration_ms);
                     
                 } else if (rx_state == RX_STATE_RECEIVING) {
                     if (duration_ms >= 12 && duration_ms <= 18) {
@@ -309,7 +323,16 @@ static void receiver_task(void *arg) {
                     }
                 }
             } else if (last_level == 0 && level == 1) {
-                // Rising edge - check for end of frame
+                // Rising edge - end of LOW pulse
+                int64_t duration_us = duration;
+                
+                // Log LOW pulses that might be protocol-related
+                if (duration_us >= 500) {
+                    ESP_LOGI(TAG, "Rising edge: LOW was %lld us (%.1f ms)", 
+                             duration_us, (float)duration_us / 1000.0f);
+                }
+                
+                // Check for end of frame
                 if (rx_state == RX_STATE_RECEIVING && duration > 50000) {
                     // Long LOW > 50ms = end of frame
                     if (rx_byte_count > 0) {
@@ -323,6 +346,32 @@ static void receiver_task(void *arg) {
             
             last_time = now;
             last_level = level;
+        }
+        
+        // Periodic activity report every 10 seconds
+        if (now - last_activity_report >= ACTIVITY_REPORT_INTERVAL) {
+            int current_gpio_level = gpio_get_level(data_gpio);
+            
+            ESP_LOGI(TAG, "=== GPIO Activity Report ===");
+            ESP_LOGI(TAG, "  Current GPIO level: %d", current_gpio_level);
+            ESP_LOGI(TAG, "  Total edges in last 10s: %lu", edge_count);
+            ESP_LOGI(TAG, "  RX state: %s", 
+                     rx_state == RX_STATE_IDLE ? "IDLE" : 
+                     rx_state == RX_STATE_RECEIVING ? "RECEIVING" : "COMPLETE");
+            ESP_LOGI(TAG, "  Valid status: %s", current_status.valid ? "YES" : "NO");
+            
+            if (edge_count == 0) {
+                ESP_LOGW(TAG, "  WARNING: No activity detected - check:");
+                ESP_LOGW(TAG, "    1. Heat pump is powered ON");
+                ESP_LOGW(TAG, "    2. Wiring: GPIO2 <-> BSS138 <-> PC1001");
+                ESP_LOGW(TAG, "    3. Common ground between ESP and PC1001");
+            } else if (edge_count < 100 && !current_status.valid) {
+                ESP_LOGW(TAG, "  Low activity but no valid frames - check protocol");
+            }
+            ESP_LOGI(TAG, "===========================");
+            
+            edge_count = 0;
+            last_activity_report = now;
         }
     }
 }
@@ -458,6 +507,10 @@ esp_err_t pc1001_driver_init(gpio_num_t gpio_num, pc1001_status_callback_t callb
         return ret;
     }
     
+    // Read initial GPIO level for diagnostics
+    int initial_level = gpio_get_level(data_gpio);
+    ESP_LOGI(TAG, "GPIO%d initial level: %d (expect 1/HIGH when idle)", data_gpio, initial_level);
+    
     // Create receiver task
     BaseType_t task_ret = xTaskCreate(receiver_task, "pc1001_rx", 4096, NULL, 5, &receiver_task_handle);
     if (task_ret != pdPASS) {
@@ -465,7 +518,8 @@ esp_err_t pc1001_driver_init(gpio_num_t gpio_num, pc1001_status_callback_t callb
         return ESP_FAIL;
     }
     
-    ESP_LOGI(TAG, "PC1001 driver initialized on GPIO%d", data_gpio);
+    ESP_LOGI(TAG, "PC1001 driver initialized on GPIO%d - listening for frames", data_gpio);
+    ESP_LOGI(TAG, "Waiting for heat pump status frames (type 0x81)...");
     return ESP_OK;
 }
 

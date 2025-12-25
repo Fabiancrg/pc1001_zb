@@ -338,12 +338,17 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
     
     if (message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT) {
         pc1001_status_t current_status;
-        if (pc1001_get_status(&current_status) != ESP_OK) {
-            ESP_LOGW(TAG, "No PC1001 status available yet");
-            return ESP_OK;
+        bool status_available = (pc1001_get_status(&current_status) == ESP_OK);
+        
+        if (!status_available) {
+            ESP_LOGW(TAG, "No PC1001 status available yet - using defaults");
+            // Use safe default values when heat pump status not yet received
+            current_status.temp_prog = 26.0f;  // Default 26°C
+            current_status.mode = PC1001_MODE_HEAT;  // Default heat mode
+            current_status.power = false;  // Default off
         }
         
-        // Prepare command with current values
+        // Prepare command with current (or default) values
         pending_cmd.temp = current_status.temp_prog;
         pending_cmd.mode = current_status.mode;
         pending_cmd.power = current_status.power;
