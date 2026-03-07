@@ -147,7 +147,7 @@ GND      ------>  GND   <---->  GND  <------>  GND
 
 ### Prerequisites
 
-- ESP-IDF v5.5.1 or later
+- ESP-IDF v5.5.3 or later
 - ESP32-C6 support enabled
 
 ### Build Commands
@@ -488,5 +488,5 @@ For issues and questions:
 
 **Version**: 1.0.0  
 **Target**: ESP32-C6  
-**Framework**: ESP-IDF v5.5.1+  
+**Framework**: ESP-IDF v5.5.3+  
 **Protocol**: Manchester-encoded bidirectional serial
