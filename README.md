@@ -100,18 +100,6 @@ GND      ------>  GND   <---->  GND  <------>  GND
 4. **Wire Length**: Keep data line < 30cm for reliable Manchester timing
 5. **Shielding**: Consider twisted pair or shielded cable in electrically noisy environments
 
-#### Determining PC1001 Output Type:
-
-**To check if push-pull or open-drain:**
-1. Measure NET pin voltage when idle with oscilloscope
-2. **Push-pull**: Voltage switches between 0V and 5V cleanly
-3. **Open-drain**: Requires pull-up resistor, voltage pulled high by resistor
-4. The BSS138 circuit works reliably with both output types
-
-**Quick test without scope:**
-- If PC1001 works with simple resistor divider, it's push-pull
-- If it needs pull-up resistor to function, it's open-drain
-
 ## 🛠️ Building and Flashing
 
 ### Prerequisites
@@ -287,16 +275,7 @@ Available channels: 11-26 (use mask: `1 << channel`)
 
 Default range is **15-32°C** in 0.5°C steps. These match PC1001 hardware limits and are set in the thermostat cluster configuration.
 
-## 🐛 Debugging
-
-### Enable Debug Logging
-
-```bash
-idf.py menuconfig
-# Component config -> Log output -> Default log verbosity -> Debug
-```
-
-### Common Issues
+## 🐛 Common Issues
 
 **Problem**: No data received from PC1001
 - Check wiring (GPIO2 to DATA line, GND to GND)
@@ -436,14 +415,6 @@ This project is provided as-is for personal and educational use.
 - **acw02_zb** - Airton HVAC controller (similar UART protocol)
 - **caelum-weatherstation** - Weather station with sleep mode
 - **Aeris_zb** - Air quality sensor with multiple endpoints
-
-## 📞 Support
-
-For issues and questions:
-1. Check debug logs with `idf.py monitor`
-2. Verify PC1001 protocol timing with logic analyzer
-3. Test with original Arduino code first to confirm PC1001 operation
-4. Review Zigbee2MQTT or ZHA logs for integration issues
 
 ---
 
