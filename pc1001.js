@@ -75,7 +75,7 @@ const fzLocal = {
 };
 
 const definition = {
-    zigbeeModel: ['PC1001_ZB_v1'],
+    zigbeeModel: ['PC1001_ZB_v1', 'PC1001_ZB'],
     model: 'PC1001-ZB',
     vendor: 'Custom devices (DiY)',
     description: 'PC1001 Pool Heat Pump Controller via Zigbee (End Device)',

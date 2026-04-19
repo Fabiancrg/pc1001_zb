@@ -13,11 +13,19 @@
 // Note: These should be defined in CMakeLists.txt and passed as compile definitions
 // Fallback values only used if not defined by CMake
 #ifndef OTA_UPGRADE_MANUFACTURER
+#ifdef OTA_MANUFACTURER
+#define OTA_UPGRADE_MANUFACTURER  OTA_MANUFACTURER
+#else
 #define OTA_UPGRADE_MANUFACTURER  0xFABC    // DIY manufacturer code
+#endif
 #endif
 
 #ifndef OTA_UPGRADE_IMAGE_TYPE
+#ifdef OTA_IMAGE_TYPE
+#define OTA_UPGRADE_IMAGE_TYPE    OTA_IMAGE_TYPE
+#else
 #define OTA_UPGRADE_IMAGE_TYPE    0x1000    // Default image type
+#endif
 #endif
 
 #ifdef __cplusplus
