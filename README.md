@@ -1,6 +1,6 @@
 # ESP32-C6 PC1001 Pool Heat Pump Controller - Zigbee
 
-ESP32-C6 Zigbee router device for controlling Hayward/Majestic PC1001 pool heat pump controllers via Manchester-encoded serial protocol.
+ESP32-C6 Zigbee End Device for controlling Hayward/Majestic PC1001 pool heat pump controllers via Manchester-encoded serial protocol.
 
 ## 🌟 Features
 
@@ -109,12 +109,13 @@ GND      ------>  GND   <---->  GND  <------>  GND
         |                 |
        10kΩ             10kΩ
         |                 |
-        +---[BSS138]------+---> PC1001 NET
-        |    Gate | Drain
-  ESP32 GPIO     |
-              Source
-                 |
-                GND
+        +--- Source    Drain ---+---> PC1001 NET
+        |      [BSS138]
+        |       Gate
+        |         |
+        +---------+  (Gate tied to LV/3.3V rail)
+
+  ESP32 GPIO ---> Source (LV side)
 ```
 
 **Features:**
@@ -162,11 +163,12 @@ idf.py menuconfig
 # Build
 idf.py build
 
-# Flash and monitor
-idf.py -p COMx flash monitor
-```
+# Flash and monitor (Windows)
+idf.py -p COM3 flash monitor
 
-Replace `COMx` with your serial port (e.g., `COM3` on Windows, `/dev/ttyUSB0` on Linux).
+# Flash and monitor (Linux/macOS)
+idf.py -p /dev/ttyUSB0 flash monitor
+```
 
 ## 📡 Zigbee Configuration
 
@@ -207,33 +209,23 @@ The device operates as a **Zigbee End Device** (mains powered, rx_on_when_idle=t
 
 ### Zigbee2MQTT
 
-The device will appear as a thermostat with two temperature sensors:
+With Zigbee2MQTT's native Home Assistant integration (MQTT Discovery enabled), the device is **auto-discovered** — no manual YAML configuration is required.
 
-**Endpoint 1 (Thermostat)**:
+The device will appear as:
+- **EP1**: A `climate` entity named after the device, with inlet temperature, target temperature, and mode selector (off/heat/cool/auto)
+- **EP2**: A `sensor` entity for water outlet temperature
+
+To enable auto-discovery, ensure `homeassistant: true` is set in your Zigbee2MQTT `configuration.yaml`:
+
 ```yaml
-climate:
-  - platform: mqtt
-    name: "Pool Heat Pump"
-    modes:
-      - "off"
-      - "heat"
-      - "cool"
-      - "auto"
-    temperature_unit: "C"
-    current_temperature_topic: "zigbee2mqtt/PC1001/local_temperature"
-    temperature_command_topic: "zigbee2mqtt/PC1001/occupied_heating_setpoint/set"
-    mode_command_topic: "zigbee2mqtt/PC1001/system_mode/set"
+homeassistant: true
 ```
 
-**Endpoint 2 (Temperature Sensor)**:
-```yaml
-sensor:
-  - platform: mqtt
-    name: "Pool Water Outlet Temperature"
-    state_topic: "zigbee2mqtt/PC1001/temperature_outlet"
-    unit_of_measurement: "°C"
-    device_class: temperature
-```
+The MQTT topics exposed by Zigbee2MQTT (useful for debugging or custom automations) follow the pattern:
+- `zigbee2mqtt/<friendly_name>/local_temperature`
+- `zigbee2mqtt/<friendly_name>/occupied_heating_setpoint`
+- `zigbee2mqtt/<friendly_name>/system_mode`
+- `zigbee2mqtt/<friendly_name>/temperature_outlet`
 
 ### ZHA (Zigbee Home Automation)
 
@@ -291,7 +283,7 @@ The PC1001 broadcasts status frames continuously:
 Temperature is encoded in 0.5°C steps from 15°C to 32°C:
 - Bit 7 (0x80): Half degree flag
 - Bits 6-1: Temperature value (reversed bits)
-- Formula: `temp = (reversed_bits(byte) & 0x3E) >> 1) + 2`
+- Formula: `temp = ((reversed_bits(byte) & 0x3E) >> 1) + 2`
 
 ### Mode Encoding
 
@@ -467,7 +459,8 @@ This project is provided as-is for personal and educational use.
 
 ## 🙏 Credits
 
-- Based on Arduino MQTT implementation by original author
+- **sle118/hayward_pool_heater** - Comprehensive ESPHome component with full frame definitions
+- **atlas2003/njanik** - Original Arduino/MQTT implementation
 - ESP-IDF and Zigbee stack by Espressif Systems
 
 ## 🔗 Related Projects
