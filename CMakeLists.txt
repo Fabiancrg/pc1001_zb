@@ -11,7 +11,7 @@ project(pc1001_zb)
 
 # Version configuration
 set(PROJECT_VER "1.0.0")
-set(BUILD_NUMBER 0)
+set(BUILD_NUMBER 10)
 set(MANUFACTURER_CODE "0xFABC")
 set(IMAGE_TYPE "0x1300")
 set(ZIGBEE_STACK_VERSION "0x0003")  # Zigbee 3.0
