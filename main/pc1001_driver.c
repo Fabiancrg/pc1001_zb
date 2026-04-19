@@ -21,19 +21,24 @@ static const char *TAG = "PC1001_DRV";
 static gpio_num_t data_gpio = GPIO_NUM_NC;
 static pc1001_status_callback_t status_callback = NULL;
 
-/* Protocol timing (in microseconds) */
-#define TIMING_START_LOW    9000    // Start bit low time
-#define TIMING_START_HIGH   5000    // Start bit high time
-#define TIMING_BIT0_HIGH    1000    // Binary 0 high time
-#define TIMING_BIT1_HIGH    3000    // Binary 1 high time
-#define TIMING_BIT_LOW      1000    // All bits low time
+/* TX protocol timing (microseconds) */
+#define TIMING_START_LOW    9000    // Start bit low
+#define TIMING_START_HIGH   5000    // Start bit high
+#define TIMING_BIT0_HIGH    1000    // Binary 0 high
+#define TIMING_BIT1_HIGH    3000    // Binary 1 high
+#define TIMING_BIT_LOW      1000    // All bits low
 #define TIMING_SPACE        100000  // Space between frame repetitions (100ms)
-#define TIMING_SPACE_SHORT  125000  // Short spacing (125ms)
-#define TIMING_SPACE_LONG   1000000 // Long spacing (1s) after frame groups
-#define TIMING_GROUP_SPACE  2000000 // Space after 8 frames
 
-/* Tolerance for timing detection (±40%) */
-#define TIMING_TOLERANCE    0.4
+/* RX classification windows (microseconds).
+ * Protocol: 5ms frame-start, 3ms bit-1, 1ms bit-0 HIGH pulses.
+ * Wide windows absorb scheduling jitter but stay mutually exclusive. */
+#define RX_START_MIN_US     4000
+#define RX_START_MAX_US     6000
+#define RX_BIT1_MIN_US      2200
+#define RX_BIT1_MAX_US      3800
+#define RX_BIT0_MIN_US       400
+#define RX_BIT0_MAX_US      1600
+#define RX_EOF_MIN_US      50000    // LOW >50ms marks end of frame
 
 /* Frame structure */
 #define FRAME_SIZE_LONG     12      // 12 bytes for long frames
@@ -84,14 +89,24 @@ static pc1001_status_t current_status = {
     .valid = false
 };
 
-/* Receiver state */
-static volatile rx_state_t rx_state = RX_STATE_IDLE;
-static volatile uint32_t high_count = 0;
-static volatile uint8_t rx_buffer[RX_BUFFER_SIZE];
-static volatile uint8_t rx_bit_buffer = 0;
-static volatile uint8_t rx_bit_count = 0;
-static volatile uint8_t rx_byte_count = 0;
-static volatile int64_t last_edge_time = 0;
+/* Receiver state (owned by receiver_task) */
+static rx_state_t rx_state = RX_STATE_IDLE;
+static uint8_t rx_buffer[RX_BUFFER_SIZE];
+static uint8_t rx_bit_buffer = 0;
+static uint8_t rx_bit_count = 0;
+static uint8_t rx_byte_count = 0;
+
+/* Edge events pushed from ISR to receiver_task */
+typedef struct {
+    int64_t timestamp;
+    uint8_t level;      // level AFTER the edge
+} edge_event_t;
+
+#define EDGE_QUEUE_DEPTH    256
+static QueueHandle_t edge_queue = NULL;
+
+/* ISR enable flag - disabled during TX so we don't self-capture */
+static volatile bool rx_isr_enabled = false;
 
 /* Processing flag to prevent command conflicts */
 static volatile bool is_processing_cmd = false;
@@ -249,72 +264,80 @@ static void process_received_frame(const uint8_t *frame, uint8_t size) {
 }
 
 /**
- * @brief Receiver task - processes timing-based protocol decoding
+ * @brief GPIO edge ISR - timestamps edges and queues them for the decoder task.
+ * Dropped silently if the queue is full or the ISR is gated during TX.
+ */
+static void IRAM_ATTR data_gpio_isr(void *arg) {
+    if (!rx_isr_enabled) {
+        return;
+    }
+    edge_event_t evt = {
+        .timestamp = esp_timer_get_time(),
+        .level = (uint8_t)gpio_get_level(data_gpio),
+    };
+    BaseType_t hp_woken = pdFALSE;
+    xQueueSendFromISR(edge_queue, &evt, &hp_woken);
+    if (hp_woken) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+/**
+ * @brief Reset the RX decoder state.
+ */
+static void rx_reset(void) {
+    rx_state = RX_STATE_IDLE;
+    rx_bit_count = 0;
+    rx_bit_buffer = 0;
+    rx_byte_count = 0;
+}
+
+/**
+ * @brief Receiver task - drains edge queue, decodes Manchester frames.
+ *
+ * Classification is done on the duration of HIGH pulses (falling edges);
+ * the trailing long LOW (rising edge) terminates a frame.
  */
 static void receiver_task(void *arg) {
-    ESP_LOGI(TAG, "Receiver task started");
-    
-    int last_level = 1;
+    ESP_LOGI(TAG, "Receiver task started (ISR-driven)");
+
     int64_t last_time = esp_timer_get_time();
-    uint32_t loop_counter = 0;
-    
-    // Activity monitoring
+    uint8_t last_level = (uint8_t)gpio_get_level(data_gpio);
+
     uint32_t edge_count = 0;
-    int64_t last_activity_report = esp_timer_get_time();
-    const int64_t ACTIVITY_REPORT_INTERVAL = 10000000; // 10 seconds
-    
+    uint32_t start_count = 0;
+    uint32_t frame_count = 0;
+    int64_t last_report = esp_timer_get_time();
+    const int64_t REPORT_INTERVAL_US = 10 * 1000 * 1000;
+
+    edge_event_t evt;
     while (1) {
-        ets_delay_us(200);  // 200µs polling to match Arduino timing
-        
-        // Feed watchdog every ~1ms (5 iterations x 200µs)
-        // Use pdMS_TO_TICKS(1) to ensure proper yield
-        loop_counter++;
-        if (loop_counter >= 5) {
-            vTaskDelay(pdMS_TO_TICKS(1));  // Yield for 1ms to reset watchdog
-            loop_counter = 0;
-        }
-        
-        int level = gpio_get_level(data_gpio);
-        int64_t now = esp_timer_get_time();
-        int64_t duration = now - last_time;
-        
-        if (level != last_level) {
-            // Edge detected
+        if (xQueueReceive(edge_queue, &evt, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            int64_t duration = evt.timestamp - last_time;
             edge_count++;
-            
-            if (last_level == 1 && level == 0) {
-                // Falling edge - end of HIGH pulse
-                int64_t duration_us = duration;
-                int64_t duration_ms = duration_us / 1000;
-                
-                // Log pulses that might be protocol-related (>500us)
-                if (duration_us >= 500) {
-                    ESP_LOGI(TAG, "Falling edge: HIGH was %lld us (%.1f ms)", 
-                             duration_us, (float)duration_us / 1000.0f);
-                }
-                
-                if (duration_ms >= 22 && duration_ms <= 28) {
-                    // Start of frame (5ms ± tolerance)
+
+            if (last_level == 1 && evt.level == 0) {
+                // HIGH pulse just ended - classify by duration
+                if (duration >= RX_START_MIN_US && duration <= RX_START_MAX_US) {
                     rx_state = RX_STATE_RECEIVING;
                     rx_bit_count = 0;
                     rx_bit_buffer = 0;
                     rx_byte_count = 0;
-                    ESP_LOGI(TAG, "Frame start detected (pulse: %lld ms)", duration_ms);
-                    
+                    start_count++;
                 } else if (rx_state == RX_STATE_RECEIVING) {
-                    if (duration_ms >= 12 && duration_ms <= 18) {
-                        // Binary 1 (3ms)
-                        rx_bit_buffer = rx_bit_buffer << 1;
-                        rx_bit_buffer |= 1;
+                    if (duration >= RX_BIT1_MIN_US && duration <= RX_BIT1_MAX_US) {
+                        rx_bit_buffer = (uint8_t)((rx_bit_buffer << 1) | 1);
                         rx_bit_count++;
-                    } else if (duration_ms >= 2 && duration_ms <= 8) {
-                        // Binary 0 (1ms)
-                        rx_bit_buffer = rx_bit_buffer << 1;
+                    } else if (duration >= RX_BIT0_MIN_US && duration <= RX_BIT0_MAX_US) {
+                        rx_bit_buffer = (uint8_t)(rx_bit_buffer << 1);
                         rx_bit_count++;
+                    } else {
+                        // Out-of-spec pulse mid-frame - abort
+                        ESP_LOGD(TAG, "Abort frame: out-of-range HIGH %lld us", duration);
+                        rx_reset();
                     }
-                    
+
                     if (rx_bit_count == 8) {
-                        // Complete byte received
                         if (rx_byte_count < RX_BUFFER_SIZE) {
                             rx_buffer[rx_byte_count++] = rx_bit_buffer;
                         }
@@ -322,56 +345,36 @@ static void receiver_task(void *arg) {
                         rx_bit_buffer = 0;
                     }
                 }
-            } else if (last_level == 0 && level == 1) {
-                // Rising edge - end of LOW pulse
-                int64_t duration_us = duration;
-                
-                // Log LOW pulses that might be protocol-related
-                if (duration_us >= 500) {
-                    ESP_LOGI(TAG, "Rising edge: LOW was %lld us (%.1f ms)", 
-                             duration_us, (float)duration_us / 1000.0f);
-                }
-                
-                // Check for end of frame
-                if (rx_state == RX_STATE_RECEIVING && duration > 50000) {
-                    // Long LOW > 50ms = end of frame
+            } else if (last_level == 0 && evt.level == 1) {
+                // LOW pulse just ended
+                if (rx_state == RX_STATE_RECEIVING && duration > RX_EOF_MIN_US) {
                     if (rx_byte_count > 0) {
                         uint8_t frame_copy[RX_BUFFER_SIZE];
-                        memcpy(frame_copy, (void*)rx_buffer, rx_byte_count);
+                        memcpy(frame_copy, rx_buffer, rx_byte_count);
                         process_received_frame(frame_copy, rx_byte_count);
+                        frame_count++;
                     }
-                    rx_state = RX_STATE_IDLE;
+                    rx_reset();
                 }
             }
-            
-            last_time = now;
-            last_level = level;
+
+            last_time = evt.timestamp;
+            last_level = evt.level;
         }
-        
-        // Periodic activity report every 10 seconds
-        if (now - last_activity_report >= ACTIVITY_REPORT_INTERVAL) {
-            int current_gpio_level = gpio_get_level(data_gpio);
-            
-            ESP_LOGI(TAG, "=== GPIO Activity Report ===");
-            ESP_LOGI(TAG, "  Current GPIO level: %d", current_gpio_level);
-            ESP_LOGI(TAG, "  Total edges in last 10s: %lu", edge_count);
-            ESP_LOGI(TAG, "  RX state: %s", 
-                     rx_state == RX_STATE_IDLE ? "IDLE" : 
-                     rx_state == RX_STATE_RECEIVING ? "RECEIVING" : "COMPLETE");
-            ESP_LOGI(TAG, "  Valid status: %s", current_status.valid ? "YES" : "NO");
-            
+
+        int64_t now = esp_timer_get_time();
+        if (now - last_report >= REPORT_INTERVAL_US) {
+            ESP_LOGI(TAG, "RX 10s: %lu edges, %lu frame-starts, %lu decoded | GPIO=%d valid=%s",
+                     edge_count, start_count, frame_count,
+                     gpio_get_level(data_gpio),
+                     current_status.valid ? "YES" : "NO");
             if (edge_count == 0) {
-                ESP_LOGW(TAG, "  WARNING: No activity detected - check:");
-                ESP_LOGW(TAG, "    1. Heat pump is powered ON");
-                ESP_LOGW(TAG, "    2. Wiring: GPIO2 <-> BSS138 <-> PC1001");
-                ESP_LOGW(TAG, "    3. Common ground between ESP and PC1001");
-            } else if (edge_count < 100 && !current_status.valid) {
-                ESP_LOGW(TAG, "  Low activity but no valid frames - check protocol");
+                ESP_LOGW(TAG, "No GPIO activity - check heat pump power, wiring, ground");
             }
-            ESP_LOGI(TAG, "===========================");
-            
             edge_count = 0;
-            last_activity_report = now;
+            start_count = 0;
+            frame_count = 0;
+            last_report = now;
         }
     }
 }
@@ -441,7 +444,9 @@ static void send_group_space(void) {
  * @brief Transmit command frame with enhanced 16-frame cycle pattern
  */
 static void transmit_command_frame(void) {
-    // Switch to output mode
+    // Gate the RX ISR so we don't capture our own transmission as edges,
+    // then switch to output mode.
+    rx_isr_enabled = false;
     gpio_set_direction(data_gpio, GPIO_MODE_OUTPUT);
     
     // Repeat frame 16 times (full protocol cycle) or 8 times for faster response
@@ -475,9 +480,12 @@ static void transmit_command_frame(void) {
         vTaskDelay(1);  // Feed watchdog
     }
     
-    // Back to input mode
+    // Back to input mode. Drain any edge events queued during direction-switch
+    // settling, then re-enable the RX ISR.
     gpio_set_direction(data_gpio, GPIO_MODE_INPUT);
-    
+    xQueueReset(edge_queue);
+    rx_isr_enabled = true;
+
     ESP_LOGI(TAG, "Command frame transmitted (%d repetitions)", repetitions);
 }
 
@@ -488,14 +496,14 @@ esp_err_t pc1001_driver_init(gpio_num_t gpio_num, pc1001_status_callback_t callb
         ESP_LOGE(TAG, "Invalid GPIO number");
         return ESP_ERR_INVALID_ARG;
     }
-    
+
     data_gpio = gpio_num;
     status_callback = callback;
-    
-    // Configure GPIO as input without internal pull resistors
-    // Hardware has external 10K pull-ups on both sides of BSS138 level shifter
+
+    // Configure GPIO as input with both-edge interrupt.
+    // External 10K pull-ups on both sides of the BSS138 level shifter - no internal pulls.
     gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_DISABLE,
+        .intr_type = GPIO_INTR_ANYEDGE,
         .mode = GPIO_MODE_INPUT,
         .pin_bit_mask = (1ULL << data_gpio),
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -506,27 +514,55 @@ esp_err_t pc1001_driver_init(gpio_num_t gpio_num, pc1001_status_callback_t callb
         ESP_LOGE(TAG, "Failed to configure GPIO: %s", esp_err_to_name(ret));
         return ret;
     }
-    
-    // Read initial GPIO level for diagnostics
+
     int initial_level = gpio_get_level(data_gpio);
     ESP_LOGI(TAG, "GPIO%d initial level: %d (expect 1/HIGH when idle)", data_gpio, initial_level);
-    
-    // Create receiver task
-    BaseType_t task_ret = xTaskCreate(receiver_task, "pc1001_rx", 4096, NULL, 5, &receiver_task_handle);
+
+    edge_queue = xQueueCreate(EDGE_QUEUE_DEPTH, sizeof(edge_event_t));
+    if (!edge_queue) {
+        ESP_LOGE(TAG, "Failed to create edge queue");
+        return ESP_ERR_NO_MEM;
+    }
+
+    // The ISR service may already be installed (e.g. by the boot-button init).
+    ret = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "Failed to install ISR service: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = gpio_isr_handler_add(data_gpio, data_gpio_isr, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add ISR handler: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    rx_isr_enabled = true;
+
+    BaseType_t task_ret = xTaskCreate(receiver_task, "pc1001_rx", 4096, NULL,
+                                      configMAX_PRIORITIES - 3, &receiver_task_handle);
     if (task_ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create receiver task");
         return ESP_FAIL;
     }
-    
-    ESP_LOGI(TAG, "PC1001 driver initialized on GPIO%d - listening for frames", data_gpio);
+
+    ESP_LOGI(TAG, "PC1001 driver initialized on GPIO%d (ISR-driven)", data_gpio);
     ESP_LOGI(TAG, "Waiting for heat pump status frames (type 0x81)...");
     return ESP_OK;
 }
 
 esp_err_t pc1001_driver_deinit(void) {
+    rx_isr_enabled = false;
+    if (data_gpio != GPIO_NUM_NC) {
+        gpio_isr_handler_remove(data_gpio);
+    }
     if (receiver_task_handle) {
         vTaskDelete(receiver_task_handle);
         receiver_task_handle = NULL;
+    }
+    if (edge_queue) {
+        vQueueDelete(edge_queue);
+        edge_queue = NULL;
     }
     return ESP_OK;
 }
@@ -542,10 +578,9 @@ esp_err_t pc1001_send_command(const pc1001_cmd_t *cmd) {
     }
     
     if (!current_status.valid) {
-        ESP_LOGW(TAG, "No valid status received yet, cannot send command");
-        return ESP_ERR_INVALID_STATE;
+        ESP_LOGW(TAG, "No heat pump status received yet - sending blind command");
     }
-    
+
     if (is_processing_cmd) {
         ESP_LOGW(TAG, "Command already in progress");
         return ESP_ERR_INVALID_STATE;
@@ -587,13 +622,12 @@ esp_err_t pc1001_send_command(const pc1001_cmd_t *cmd) {
              cmd->power ? "ON" : "OFF",
              pc1001_mode_to_string(cmd->mode));
     
-    // Transmit
+    // Transmit (gates RX ISR internally)
     transmit_command_frame();
-    
-    // Reset receiver state
-    rx_state = RX_STATE_IDLE;
-    rx_byte_count = 0;
-    
+
+    // Reset receiver state - a new frame may arrive any moment now
+    rx_reset();
+
     is_processing_cmd = false;
     
     return ESP_OK;
