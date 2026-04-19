@@ -31,41 +31,9 @@ GND      <---->   GND
 
 The PC1001 NET data line operates at **5V TTL** logic levels while the ESP32-C6 uses **3.3V** GPIO. A bidirectional level shifter is **mandatory** for reliable communication.
 
-#### ✅ **RECOMMENDED Option 1: 74LVC1T45 (Push-Pull)**
+#### ✅ **BSS138 MOSFET (Open-Drain)**
 
-**Best choice** for push-pull PC1001 output (most common configuration):
 
-```
-Component: Texas Instruments 74LVC1T45DBVR
-Package: SOT-23-6
-Price: ~$0.30-0.50
-```
-
-**Wiring:**
-```
-ESP32-C6 (3.3V)      74LVC1T45      PC1001 (5V)
------------------    ---------      -----------
-GPIO2    <--------->   A (Data)
-3.3V     <--------->   VCCA
-                       DIR          (controlled by GPIO or tied for fixed direction)
-GND      <--------->   GND
-5V       <--------->   VCCB
-                       B (Data)  <-------> NET Pin
-```
-
-**Features:**
-- Direction-controlled (no auto-sensing delays)
-- Fast switching (3-5ns typical)
-- 24mA output drive
-- Low propagation delay
-
-**DIR Pin Options:**
-1. **Automatic switching**: Connect DIR to another GPIO, set HIGH for TX, LOW for RX
-2. **Fixed bidirectional**: Add 10kΩ pull-up to 3.3V for auto-bidirectional operation (if supported by your board configuration)
-
-#### ✅ **RECOMMENDED Option 2: BSS138 MOSFET (Open-Drain)**
-
-**Alternative choice** if PC1001 uses open-drain output or for simpler circuit:
 
 ```
 Component: BSS138 N-channel MOSFET + 2× 10kΩ resistors
@@ -138,7 +106,7 @@ GND      ------>  GND   <---->  GND  <------>  GND
 1. Measure NET pin voltage when idle with oscilloscope
 2. **Push-pull**: Voltage switches between 0V and 5V cleanly
 3. **Open-drain**: Requires pull-up resistor, voltage pulled high by resistor
-4. Most PC1001 units use **push-pull** output → use 74LVC1T45
+4. The BSS138 circuit works reliably with both output types
 
 **Quick test without scope:**
 - If PC1001 works with simple resistor divider, it's push-pull
