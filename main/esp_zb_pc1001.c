@@ -253,15 +253,9 @@ static void update_zigbee_attributes(const pc1001_status_t *status) {
                                   &heat_setpoint,
                                   false);
     
-    // Update occupied cooling setpoint
-    int16_t cool_setpoint = TEMP_TO_ZCL(status->temp_prog);
-    esp_zb_zcl_set_attribute_val(HA_THERMOSTAT_ENDPOINT,
-                                  ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT,
-                                  ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                                  ESP_ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_COOLING_SETPOINT_ID,
-                                  &cool_setpoint,
-                                  false);
-    
+    // Keep cooling setpoint pinned at 32°C so MinSetpointDeadBand (1.0°C) is
+    // never violated when the user or the heat pump pushes the heating setpoint up.
+
     // Update system mode
     uint8_t system_mode = pc1001_mode_to_zcl(status->mode, status->power);
     esp_zb_zcl_set_attribute_val(HA_THERMOSTAT_ENDPOINT,
@@ -584,10 +578,11 @@ static void esp_zb_task(void *pvParameters) {
     // According to ESP Zigbee SDK: ESP_ZB_ZCL_ATTR_ACCESS_REPORTING flag enables
     // reporting configuration to persist across reboots in zb_storage partition
     int16_t local_temp = TEMP_TO_ZCL(20.0f);
-    int16_t cool_setpoint = TEMP_TO_ZCL(26.0f);
+    int16_t cool_setpoint = TEMP_TO_ZCL(32.0f);  // Max - leaves full range for heating setpoint under deadband constraint
     int16_t heat_setpoint = TEMP_TO_ZCL(20.0f);
     uint8_t control_seq = 0x04;  // Cooling and heating
     uint8_t sys_mode = ZCL_SYSTEM_MODE_OFF;
+    int8_t min_setpoint_dead_band = 0x0a;  // 1.0°C - minimum allowed by ZCL spec (default is 2.5°C)
     
     esp_zb_attribute_list_t *esp_zb_thermostat_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT);
     
@@ -622,6 +617,13 @@ static void esp_zb_task(void *pvParameters) {
     ESP_ERROR_CHECK(esp_zb_thermostat_cluster_add_attr(esp_zb_thermostat_cluster, ESP_ZB_ZCL_ATTR_THERMOSTAT_MAX_HEAT_SETPOINT_LIMIT_ID, &max_setpoint));
     ESP_ERROR_CHECK(esp_zb_thermostat_cluster_add_attr(esp_zb_thermostat_cluster, ESP_ZB_ZCL_ATTR_THERMOSTAT_MIN_COOL_SETPOINT_LIMIT_ID, &min_setpoint));
     ESP_ERROR_CHECK(esp_zb_thermostat_cluster_add_attr(esp_zb_thermostat_cluster, ESP_ZB_ZCL_ATTR_THERMOSTAT_MAX_COOL_SETPOINT_LIMIT_ID, &max_setpoint));
+
+    // MinSetpointDeadBand enforces heat + deadband <= cool. Lower it from default
+    // (2.5°C) to the spec minimum (1.0°C) so the heating setpoint can reach close
+    // to the maximum without being blocked by the cooling setpoint.
+    ESP_ERROR_CHECK(esp_zb_thermostat_cluster_add_attr(esp_zb_thermostat_cluster,
+                                                        ESP_ZB_ZCL_ATTR_THERMOSTAT_MIN_SETPOINT_DEAD_BAND_ID,
+                                                        &min_setpoint_dead_band));
     
     ESP_ERROR_CHECK(esp_zb_cluster_list_add_thermostat_cluster(esp_zb_thermostat_clusters, 
                                                                esp_zb_thermostat_cluster, 
