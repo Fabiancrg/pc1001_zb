@@ -6,9 +6,6 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 # "Trim" the build. Include the minimal set of components, main, and anything it depends on.
 idf_build_set_property(MINIMAL_BUILD ON)
 
-
-project(pc1001_zb)
-
 # Version configuration
 set(PROJECT_VER "1.1.0")
 set(BUILD_NUMBER 0)
@@ -22,23 +19,8 @@ list(GET _ver_list 0 _ver_major)
 list(GET _ver_list 1 _ver_minor)
 list(GET _ver_list 2 _ver_patch)
 
-# Calculate OTA version dec
-math(EXPR OTA_VERSION_DEC "((${_ver_major}) << 24) | ((${_ver_minor}) << 16) | (${_ver_patch})")
-
-# Add compile definitions for version and OTA
-add_compile_definitions(
-    FW_VERSION="${PROJECT_VER}.${BUILD_NUMBER}"
-    FW_DATE_CODE="${DATE_CODE}"
-    FW_VERSION_MAJOR=${_ver_major}
-    FW_VERSION_MINOR=${_ver_minor}
-    FW_VERSION_PATCH=${_ver_patch}
-    OTA_FILE_VERSION=${OTA_VERSION_DEC}
-    OTA_MANUFACTURER=${MANUFACTURER_CODE}
-    OTA_IMAGE_TYPE=${IMAGE_TYPE}
-    OTA_UPGRADE_MANUFACTURER=${MANUFACTURER_CODE}
-    OTA_UPGRADE_IMAGE_TYPE=${IMAGE_TYPE}
-    ZB_STACK_VERSION=${ZIGBEE_STACK_VERSION}
-)
+# Calculate OTA version dec as major.minor.build
+math(EXPR OTA_VERSION_DEC "((${_ver_major}) << 24) | ((${_ver_minor}) << 16) | ((${BUILD_NUMBER}) & 0xFFFF)")
 
 
 # Convert OTA_VERSION_DEC to 8-digit uppercase hex string (CMake <3.19 workaround)
@@ -54,6 +36,24 @@ endforeach()
 
 # Generate date code
 string(TIMESTAMP DATE_CODE "%Y%m%d")
+
+project(pc1001_zb)
+
+# Add compile definitions for version and OTA
+add_compile_definitions(
+    FW_VERSION="${PROJECT_VER}.${BUILD_NUMBER}"
+    FW_DATE_CODE="${DATE_CODE}"
+    FW_VERSION_MAJOR=${_ver_major}
+    FW_VERSION_MINOR=${_ver_minor}
+    FW_VERSION_PATCH=${_ver_patch}
+    FW_BUILD_NUMBER=${BUILD_NUMBER}
+    OTA_FILE_VERSION=${OTA_VERSION_DEC}
+    OTA_MANUFACTURER=${MANUFACTURER_CODE}
+    OTA_IMAGE_TYPE=${IMAGE_TYPE}
+    OTA_UPGRADE_MANUFACTURER=${MANUFACTURER_CODE}
+    OTA_UPGRADE_IMAGE_TYPE=${IMAGE_TYPE}
+    ZB_STACK_VERSION=${ZIGBEE_STACK_VERSION}
+)
 
 # Generate a small header with version macros so components can include a single
 # header (works reliably across IDF/CMake versions and component layouts).

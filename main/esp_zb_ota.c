@@ -12,6 +12,7 @@
 #include "nvs_flash.h"
 #include "esp_zigbee_core.h"
 #include "zcl/esp_zigbee_zcl_ota.h"
+#include "version.h"
 
 static const char *TAG = "ESP_ZB_OTA";
 
@@ -258,19 +259,17 @@ esp_zb_zcl_ota_upgrade_status_t esp_zb_ota_get_status(void)
  */
 uint32_t esp_zb_ota_get_fw_version(void)
 {
+    const uint32_t version = FW_OTA_VERSION;
     const esp_app_desc_t *app_desc = esp_app_get_description();
-    uint32_t version = 0;
+
     if (app_desc) {
-        int major = 0, minor = 0, patch = 0;
-        // Only parse if string is in semver format, else fallback to 0x01000000
-        if (sscanf(app_desc->version, "%d.%d.%d", &major, &minor, &patch) == 3) {
-            version = ((major & 0xFF) << 24) | ((minor & 0xFF) << 16) | (patch & 0xFFFF);
-            ESP_LOGI(TAG, "Firmware version: %s (0x%08lX)", app_desc->version, version);
-        } else {
-            // Fallback: use 1.0.0 if not a semver string
-            version = 0x01000000;
-            ESP_LOGW(TAG, "Firmware version string not semver: '%s', using fallback 1.0.0 (0x01000000)", app_desc->version);
-        }
+        ESP_LOGI(TAG, "Firmware version: %s (app_desc=%s, ota=0x%08lX)",
+                 FW_VERSION,
+                 app_desc->version,
+                 version);
+    } else {
+        ESP_LOGI(TAG, "Firmware version: %s (ota=0x%08lX)", FW_VERSION, version);
     }
+
     return version;
 }

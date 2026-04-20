@@ -1,7 +1,7 @@
 #ifndef VERSION_H
 #define VERSION_H
 
-#define FW_VERSION "@PROJECT_VER@"
+#define FW_VERSION "@PROJECT_VER@.@BUILD_NUMBER@"
 #define FW_VERSION_MAJOR @_ver_major@
 #define FW_VERSION_MINOR @_ver_minor@
 #define FW_VERSION_PATCH @_ver_patch@
