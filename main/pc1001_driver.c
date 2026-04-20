@@ -30,15 +30,19 @@ static pc1001_status_callback_t status_callback = NULL;
 #define TIMING_SPACE        100000  // Space between frame repetitions (100ms)
 
 /* RX classification windows (microseconds).
- * Protocol: 5ms frame-start, 3ms bit-1, 1ms bit-0 HIGH pulses.
+ * The protocol is asymmetric: controller-to-pump encodes bit-1 as a long
+ * (~3ms) HIGH pulse and bit-0 as a short (~1ms) HIGH. The heat pump's
+ * broadcasts use the OPPOSITE mapping - a long HIGH means bit 0 and a
+ * short HIGH means bit 1. The windows below describe HIGH pulse durations;
+ * the bit value they decode to is assigned in receiver_task.
  * Wide windows absorb scheduling jitter but stay mutually exclusive. */
-#define RX_START_MIN_US     4000
+#define RX_START_MIN_US     4000     // 5ms header HIGH
 #define RX_START_MAX_US     6000
-#define RX_BIT1_MIN_US      2200
-#define RX_BIT1_MAX_US      3800
-#define RX_BIT0_MIN_US       400
-#define RX_BIT0_MAX_US      1600
-#define RX_EOF_MIN_US      50000    // LOW >50ms marks end of frame
+#define RX_LONG_MIN_US      2200     // ~3ms HIGH (bit 0 from pump)
+#define RX_LONG_MAX_US      3800
+#define RX_SHORT_MIN_US      400     // ~1ms HIGH (bit 1 from pump)
+#define RX_SHORT_MAX_US     1600
+#define RX_EOF_MIN_US      50000     // HIGH >50ms between frames marks end of frame
 
 /* Frame structure */
 #define FRAME_SIZE_LONG     12      // 12 bytes for long frames
@@ -295,8 +299,8 @@ static void rx_reset(void) {
 /**
  * @brief Receiver task - drains edge queue, decodes Manchester frames.
  *
- * Classification is done on the duration of HIGH pulses (falling edges);
- * the trailing long LOW (rising edge) terminates a frame.
+ * Classification is done on the duration of HIGH pulses (falling edges).
+ * A long idle HIGH (>50ms) between frame groups terminates the current frame.
  */
 static void receiver_task(void *arg) {
     ESP_LOGI(TAG, "Receiver task started (ISR-driven)");
@@ -317,19 +321,29 @@ static void receiver_task(void *arg) {
             edge_count++;
 
             if (last_level == 1 && evt.level == 0) {
-                // HIGH pulse just ended - classify by duration
-                if (duration >= RX_START_MIN_US && duration <= RX_START_MAX_US) {
+                // Falling edge - HIGH pulse just ended, classify by duration
+                if (duration > RX_EOF_MIN_US) {
+                    // Long idle HIGH (>50ms) = end of previous frame
+                    if (rx_state == RX_STATE_RECEIVING && rx_byte_count > 0) {
+                        uint8_t frame_copy[RX_BUFFER_SIZE];
+                        memcpy(frame_copy, rx_buffer, rx_byte_count);
+                        process_received_frame(frame_copy, rx_byte_count);
+                        frame_count++;
+                    }
+                    rx_reset();
+                } else if (duration >= RX_START_MIN_US && duration <= RX_START_MAX_US) {
                     rx_state = RX_STATE_RECEIVING;
                     rx_bit_count = 0;
                     rx_bit_buffer = 0;
                     rx_byte_count = 0;
                     start_count++;
                 } else if (rx_state == RX_STATE_RECEIVING) {
-                    if (duration >= RX_BIT1_MIN_US && duration <= RX_BIT1_MAX_US) {
-                        rx_bit_buffer = (uint8_t)((rx_bit_buffer << 1) | 1);
-                        rx_bit_count++;
-                    } else if (duration >= RX_BIT0_MIN_US && duration <= RX_BIT0_MAX_US) {
+                    // Heat pump: long HIGH = bit 0, short HIGH = bit 1
+                    if (duration >= RX_LONG_MIN_US && duration <= RX_LONG_MAX_US) {
                         rx_bit_buffer = (uint8_t)(rx_bit_buffer << 1);
+                        rx_bit_count++;
+                    } else if (duration >= RX_SHORT_MIN_US && duration <= RX_SHORT_MAX_US) {
+                        rx_bit_buffer = (uint8_t)((rx_bit_buffer << 1) | 1);
                         rx_bit_count++;
                     } else {
                         // Out-of-spec pulse mid-frame - abort
@@ -345,18 +359,9 @@ static void receiver_task(void *arg) {
                         rx_bit_buffer = 0;
                     }
                 }
-            } else if (last_level == 0 && evt.level == 1) {
-                // LOW pulse just ended
-                if (rx_state == RX_STATE_RECEIVING && duration > RX_EOF_MIN_US) {
-                    if (rx_byte_count > 0) {
-                        uint8_t frame_copy[RX_BUFFER_SIZE];
-                        memcpy(frame_copy, rx_buffer, rx_byte_count);
-                        process_received_frame(frame_copy, rx_byte_count);
-                        frame_count++;
-                    }
-                    rx_reset();
-                }
             }
+            // Rising edges are not used - EOF is detected on the falling edge
+            // following a long idle HIGH period
 
             last_time = evt.timestamp;
             last_level = evt.level;
@@ -364,7 +369,7 @@ static void receiver_task(void *arg) {
 
         int64_t now = esp_timer_get_time();
         if (now - last_report >= REPORT_INTERVAL_US) {
-            ESP_LOGI(TAG, "RX 10s: %lu edges, %lu frame-starts, %lu decoded | GPIO=%d valid=%s",
+            ESP_LOGI(TAG, "RX 10s: %lu edges, %lu frame-starts, %lu decoded | LEVEL=%d valid=%s",
                      edge_count, start_count, frame_count,
                      gpio_get_level(data_gpio),
                      current_status.valid ? "YES" : "NO");
