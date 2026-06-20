@@ -14,7 +14,9 @@
 #include "driver/gpio.h"
 #include "esp_mac.h"
 #include "esp_ota_ops.h"
+#include "esp_timer.h"
 #include "ha/esp_zigbee_ha_standard.h"
+#include "aps/esp_zigbee_aps.h"
 #include "pc1001_driver.h"
 #include "esp_zb_ota.h"
 #include "version.h"
@@ -52,6 +54,26 @@ static const char *TAG = "PC1001_ZB";
 /* Network connection tracking */
 static bool zigbee_connected = false;
 
+/* --- Network (re)join / link recovery -------------------------------------
+ * Three layers keep the device on the network and recover from a lost link:
+ *   1. Fast retries: on an explicit STEERING failure we re-attempt every 1 s,
+ *      up to MAX_CONNECTION_RETRIES, then back off to the watchdog cadence.
+ *   2. Rejoin watchdog: an always-on periodic timer that re-attempts steering
+ *      while disconnected, and detects a silent parent loss (stack reports
+ *      not-joined while we still think we are connected) that never raises a
+ *      STEERING signal on its own.
+ *   3. Delivery heartbeat: the APS data-confirm callback flags the link dead
+ *      after a run of failed deliveries (parent/route gone) and forces a
+ *      rejoin even when the stack still believes it is joined. */
+static uint32_t connection_retry_count = 0;
+#define MAX_CONNECTION_RETRIES          20      // Fast (1 s) retries before backing off to the slow rejoin watchdog
+
+#define REJOIN_WATCHDOG_INTERVAL_MS     (5 * 60 * 1000ULL)   // attempt rejoin / check link every 5 minutes
+static esp_timer_handle_t rejoin_watchdog_timer = NULL;
+
+#define HEARTBEAT_FAIL_THRESHOLD        3       // consecutive failed APS confirms => link considered dead
+static uint32_t aps_tx_fail_streak = 0;         // consecutive APS delivery failures (Zigbee-task only)
+
 /* Deferred update flag */
 static bool pending_update = false;
 static pc1001_cmd_t pending_cmd;
@@ -63,6 +85,9 @@ static QueueHandle_t button_evt_queue = NULL;
 static esp_err_t button_init(void);
 static void button_task(void *arg);
 static void factory_reset_device(uint8_t param);
+static void start_rejoin_watchdog(void);
+static void rejoin_watchdog_cb(void *arg);
+static void aps_data_confirm_cb(esp_zb_apsde_data_confirm_t confirm);
 
 /* Factory reset function */
 static void factory_reset_device(uint8_t param)
@@ -294,6 +319,96 @@ static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask) {
 }
 
 /**
+ * @brief Rejoin watchdog callback.
+ *
+ * Runs in the esp_timer task (NOT the Zigbee task), so every esp_zb_* call here
+ * MUST hold the stack lock. Fires periodically and:
+ *   - detects a runtime parent loss (the stack reports not-joined while we still
+ *     think we are connected) and corrects our state, and
+ *   - re-attempts network steering whenever we are disconnected, so the device
+ *     keeps trying to rejoin forever instead of giving up.
+ */
+static void rejoin_watchdog_cb(void *arg) {
+    (void)arg;
+    bool joined;
+
+    esp_zb_lock_acquire(portMAX_DELAY);
+    joined = esp_zb_bdb_dev_joined();
+    esp_zb_lock_release();
+
+    /* Runtime parent loss: flagged connected but the stack is no longer joined. */
+    if (zigbee_connected && !joined) {
+        ESP_LOGW(TAG, "[WD] Stack reports NOT joined while flagged connected - parent likely lost, rejoining");
+        zigbee_connected = false;
+    }
+
+    if (zigbee_connected) {
+        return;  // link healthy, nothing to do
+    }
+
+    ESP_LOGW(TAG, "[WD] Disconnected - attempting network steering");
+    esp_zb_lock_acquire(portMAX_DELAY);
+    esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb,
+                           ESP_ZB_BDB_MODE_NETWORK_STEERING, 0);
+    esp_zb_lock_release();
+}
+
+/**
+ * @brief Start the always-on rejoin watchdog (idempotent).
+ */
+static void start_rejoin_watchdog(void) {
+    if (rejoin_watchdog_timer != NULL) {
+        return;  // already running
+    }
+
+    const esp_timer_create_args_t args = {
+        .callback = &rejoin_watchdog_cb,
+        .name = "rejoin_wd",
+    };
+    if (esp_timer_create(&args, &rejoin_watchdog_timer) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create rejoin watchdog timer");
+        return;
+    }
+    if (esp_timer_start_periodic(rejoin_watchdog_timer, REJOIN_WATCHDOG_INTERVAL_MS * 1000ULL) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start rejoin watchdog timer");
+        esp_timer_delete(rejoin_watchdog_timer);
+        rejoin_watchdog_timer = NULL;
+        return;
+    }
+    ESP_LOGI(TAG, "[WD] Rejoin watchdog started (every %llu min)", REJOIN_WATCHDOG_INTERVAL_MS / 60000ULL);
+}
+
+/**
+ * @brief APS data-confirm callback: the delivery heartbeat.
+ *
+ * Invoked by the stack (Zigbee task context) for every outgoing APS frame, so
+ * esp_zb_* calls here are safe without the lock. A run of failed confirms means
+ * the link is dead even if the stack still thinks we are joined - force a rejoin.
+ */
+static void aps_data_confirm_cb(esp_zb_apsde_data_confirm_t confirm) {
+    if (confirm.status == 0) {
+        /* Delivered: link is alive. */
+        aps_tx_fail_streak = 0;
+        return;
+    }
+
+    /* Delivery failed (no ACK / no route to parent or coordinator). */
+    aps_tx_fail_streak++;
+    ESP_LOGW(TAG, "[APS] Delivery failed (status=0x%02x, streak=%lu/%d)",
+             confirm.status, (unsigned long)aps_tx_fail_streak, HEARTBEAT_FAIL_THRESHOLD);
+
+    if (zigbee_connected && aps_tx_fail_streak >= HEARTBEAT_FAIL_THRESHOLD) {
+        ESP_LOGW(TAG, "[APS] %lu consecutive failures - parent/route lost, forcing rejoin",
+                 (unsigned long)aps_tx_fail_streak);
+        zigbee_connected = false;
+        aps_tx_fail_streak = 0;
+        /* Zigbee task context: schedule steering directly (no lock needed). */
+        esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb,
+                               ESP_ZB_BDB_MODE_NETWORK_STEERING, 0);
+    }
+}
+
+/**
  * @brief Send pending PC1001 command
  */
 static void send_pending_command(uint8_t param) {
@@ -441,11 +556,23 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
                     esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
                 }
             } else {
-                ESP_LOGW(TAG, "Failed to initialize Zigbee stack (status: %s)", 
+                ESP_LOGW(TAG, "Failed to initialize Zigbee stack (status: %s) - attempting to rejoin",
                          esp_err_to_name(err_status));
+                /* Don't give up: the rejoin watchdog will keep retrying, but kick
+                 * off an immediate steering attempt too if we previously joined. */
+                if (!esp_zb_bdb_is_factory_new()) {
+                    esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
+                }
             }
             break;
-            
+
+        case ESP_ZB_ZDO_SIGNAL_LEAVE:
+            ESP_LOGW(TAG, "Device left the Zigbee network - rejoin watchdog will keep retrying");
+            zigbee_connected = false;
+            connection_retry_count = 0;
+            aps_tx_fail_streak = 0;
+            break;
+
         case ESP_ZB_BDB_SIGNAL_STEERING:
             if (err_status == ESP_OK) {
                 esp_zb_ieee_addr_t extended_pan_id;
@@ -456,16 +583,34 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
                          esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address());
                 
                 zigbee_connected = true;
-                
+                connection_retry_count = 0;
+                aps_tx_fail_streak = 0;  // fresh link: clear stale delivery-heartbeat state
+
                 // Initial status read
                 pc1001_status_t status;
                 if (pc1001_get_status(&status) == ESP_OK) {
                     update_zigbee_attributes(&status);
                 }
             } else {
-                ESP_LOGI(TAG, "Network steering was not successful (status: %s)", 
+                ESP_LOGI(TAG, "Network steering was not successful (status: %s)",
                          esp_err_to_name(err_status));
-                esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb, 
+                zigbee_connected = false;
+                connection_retry_count++;
+
+                /* Fast retries exhausted: stop the aggressive 1 s loop and let the
+                 * always-on rejoin watchdog keep trying at its slow cadence. We do
+                 * NOT give up - the device keeps attempting to rejoin indefinitely. */
+                if (connection_retry_count >= MAX_CONNECTION_RETRIES) {
+                    if (connection_retry_count == MAX_CONNECTION_RETRIES) {
+                        ESP_LOGW(TAG, "Fast retries (%d) exhausted - backing off to rejoin watchdog (every %llu min)",
+                                 MAX_CONNECTION_RETRIES, REJOIN_WATCHDOG_INTERVAL_MS / 60000ULL);
+                    }
+                    break;
+                }
+
+                ESP_LOGW(TAG, "Connection attempt %lu/%d failed - retrying",
+                         (unsigned long)connection_retry_count, MAX_CONNECTION_RETRIES);
+                esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb,
                                       ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
             }
             break;
@@ -714,14 +859,22 @@ static void esp_zb_task(void *pvParameters) {
     // Register device
     esp_zb_device_register(esp_zb_ep_list);
     esp_zb_core_action_handler_register(zb_action_handler);
-    
+
+    /* Delivery heartbeat: react to APS TX confirms so we detect a silent
+     * parent/route loss and force a rejoin (see aps_data_confirm_cb). */
+    esp_zb_aps_data_confirm_handler_register(aps_data_confirm_cb);
+
     // Set primary channel
     ESP_ERROR_CHECK(esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK));
-    
+
     // Start Zigbee stack
     ESP_ERROR_CHECK(esp_zb_start(false));
-    
+
     ESP_LOGI(TAG, "Zigbee stack started");
+
+    /* Always-on rejoin watchdog: keeps (re)joining forever and recovers from a
+     * runtime parent loss the stack won't signal on its own. */
+    start_rejoin_watchdog();
     
     // Main loop
     esp_zb_stack_main_loop();

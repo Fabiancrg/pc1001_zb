@@ -1,0 +1,14 @@
+[
+  {
+    "fileVersion": 16842752,
+    "fileSize": 523006,
+    "manufacturerCode": 64188,
+    "imageType": 4864,
+    "sha512": "35780379b6bc78ff2e686c00a62a817edbcbf0a536f7e4ad669dbb1b11be9e844ad1fb0e346da43cc6852d3cb62356b44df3d7aeb7f2f7de30785cf4ead98933",
+    "url": "pc1001_zb_v1.1.0.0.ota",
+    "modelId": "PC1001_ZB",
+    "manufacturerName": [
+      "Custom devices (DiY)"
+    ]
+  }
+]
