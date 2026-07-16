@@ -75,7 +75,7 @@ add_custom_target(generate_ota ALL
     COMMAND ${CMAKE_COMMAND} -E echo "  Stack Version: ${ZIGBEE_STACK_VERSION}"
     COMMAND ${CMAKE_COMMAND} -E echo "================================================"
     COMMAND ${Python3_EXECUTABLE} 
-            "$ENV{HOME}/Repositories/esp-zigbee-sdk/tools/image_builder_tool/image_builder_tool.py"
+            "/home/fabian/Repositories/esp-zigbee-sdk/tools/image_builder_tool/image_builder_tool.py"
             -f "${CMAKE_BINARY_DIR}/${PROJECT_NAME}.bin"
             -c "${CMAKE_BINARY_DIR}/${PROJECT_NAME}_v${PROJECT_VER}.${BUILD_NUMBER}.ota"
             -m ${MANUFACTURER_CODE}
